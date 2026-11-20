@@ -22,6 +22,8 @@ Statuses:
 | DD-10 | Chapters 5–6 | Chapter 5 proposes interactive spec approval; Chapter 6 proposes a separate test-author and locked tests. | Builder uses/runs TDD tests prepared before implementation. The user has not decided who authors them; do not infer acceptance or reject the separate test-author proposal yet. | Open; resolve in Chapter 6 |
 | DD-11 | §2.1; Chapter 1 transition proposal | Generic `transition` exists, but its interaction with guarded normal transitions was not fully settled. | Generic CLI transition is limited to escalation/resume; normal forward transitions require their owning commands and precondition checks. `SPEC_APPROVED` is required before branch attachment; Chapter 5's `approve-spec` reaches that state. | Resolved; approval workflow is Chapter 5 |
 | DD-12 | Chapter 1 CLI proposal | Output/error shapes and numeric exit-code categories are unspecified. | Success is JSON on stdout; errors go to stderr; exit `2` means usage/configuration error and `1` means operational failure. | Resolved in the Chapter 1 contract |
+| DD-13 | Chapter 1 factory config | The config location is known, but factory-root discovery is unspecified. | The CLI runs from the factory repository root; the current working directory is the factory root for `config.json` and relative data paths. | Resolved |
+| DD-14 | D14 `.factory/project.json` | The project config proposes a `work_branch` template. | The person prepares the exact local branch after spec approval and passes it to `worktree attach`; no branch template or automatic branch creation is used initially. | Resolved; branch-per-job remains deferred |
 
 ## Review workflow
 

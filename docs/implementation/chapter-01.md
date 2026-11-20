@@ -62,10 +62,11 @@ This contract translates the reviewed Chapter 1 decisions into testable work. It
 - `factory job list` returns jobs in stable `job_id` order.
 - `factory job transition JOB_ID NEEDS_HUMAN|FAILED --reason TEXT` is for administrative escalation only.
 - `factory job resume JOB_ID --reason TEXT` returns only to the state saved when the job entered `NEEDS_HUMAN`.
-- Worktree operations are exposed as `factory job worktree attach|repair|release`. Attach requires `SPEC_APPROVED`; Chapter 5's `approve-spec` command records that state. Chapter 1 does not add a generic CLI path to bypass that precondition.
+- Worktree operations are exposed as `factory job worktree attach JOB_ID --branch LOCAL_BRANCH`, `repair JOB_ID`, and `release JOB_ID`. Attach requires `SPEC_APPROVED`; Chapter 5's `approve-spec` command records that state. Chapter 1 does not add a generic CLI path to bypass that precondition.
 - Successful commands emit JSON on stdout. Errors go to stderr: exit `2` for usage/configuration errors and `1` for operational failures.
-- The factory root `config.json` defines `jobs_dir` and `worktrees_dir`; relative values resolve from the factory repository root. Defaults are `jobs` and `worktrees`.
-- `--project PATH` is explicit and identifies the target repository root. Its `.factory/project.json` provides at least `project`, `remote`, and `base_branch`; known later fields such as `checks` and `pr_target` may be present but are not executed in this chapter.
+- The factory root `config.json` defines `jobs_dir` and `worktrees_dir`; relative values resolve from the factory repository root and must remain inside it. Defaults are `jobs` and `worktrees`.
+- The CLI is invoked from the factory repository root. That current working directory is the factory root used to load `config.json` and resolve relative data paths.
+- `--project PATH` is explicit and identifies the target repository root. Its `.factory/project.json` provides at least `project`, `remote`, and `base_branch`; known later fields such as `checks` and `pr_target` may be present but are not executed in this chapter. The chosen work branch is supplied to `attach`, not stored as a branch template in this project config.
 - Job data lives at `jobs/<job_id>/`. Worktrees live at `worktrees/<project>/<job_id>/`.
 - Proposed `job_id`: factory-generated UUID4. A project identifier must be a safe path component and must not map two different target repositories to the same worktree root.
 
@@ -115,7 +116,7 @@ Initial state is `DRAFT_SPEC`. Normal forward transitions follow the pipeline in
 
 ### Direct worktree lifecycle and errors
 
-- A job starts without a branch/worktree. After spec approval, a person prepares an existing local `refs/heads/...` branch and supplies it to `worktree attach`.
+- A job starts without a branch/worktree. After spec approval, a person prepares an existing local `refs/heads/...` branch without checking it out elsewhere, then supplies it to `worktree attach`.
 - Attach rejects invalid refs, missing local branches, branches already checked out in any worktree, occupied paths, and mismatched project identities. A remote-tracking-only branch must first be checked out by a person.
 - Attach fetches the configured base remote, records `base_sha` and the selected branch's current `work_branch_start_sha`, then attaches the branch at the registered factory worktree path. It never creates or resets a branch.
 - Persist an attach intent before Git side effects. `repair` is idempotent for an interrupted/missing registered worktree: validate ownership and reattach the same branch at its current HEAD, without fetch/reset or deleting anything. Collisions fail closed.
