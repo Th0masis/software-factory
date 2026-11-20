@@ -1,15 +1,15 @@
 # Chapter 1 — Progress
 
-- **Overall status:** CH1-01 and CH1-02 complete; CH1-03 verified, checkpoint commit pending.
+- **Overall status:** CH1-01, CH1-02, and CH1-03 complete.
 - **Current branch:** `docs/chapter-01-contract`
 - **Contract:** [`chapter-01.md`](./chapter-01.md)
 - **Design deltas:** [`design-deviations.md`](./design-deviations.md)
 
 ## Checkpoint summary
 
-- **Completed:** Chapter 1 specification review and contract approval; CH1-01 metadata-only job creation, `status`, and `list`.
-- **Verified:** CH1-01 and CH1-02 acceptance checks pass; all tests use temporary repositories.
-- **Remaining:** Record the CH1-03 checkpoint SHA. TDD test authorship remains deferred to Chapter 6.
+- **Completed:** Chapter 1 specification review and contract approval; CH1-01 metadata-only job creation, CH1-02 state/recovery, and CH1-03 worktree lifecycle.
+- **Verified:** All 28 tests pass; Git integration tests use temporary repositories.
+- **Remaining:** TDD test authorship remains deferred to Chapter 6.
 - **Blockers:** None.
 
 ## Slice status
@@ -18,7 +18,7 @@
 |---|---|---|---|---|
 | CH1-01 — Creating metadata-only jobs | Complete | PASS (8 tests) | `4be2bde` | Metadata-only creation and public CLI queries |
 | CH1-02 — Enforcing transitions and journal recovery | Complete | PASS (18 tests) | `7aed742` | Escalation/resume, validated journal replay, recovery, and process lock |
-| CH1-03 — Attaching and recovering a direct worktree | Verified; checkpoint pending | PASS (28 tests) | — | Attach, repair and clean-only release with interrupted-release recovery |
+| CH1-03 — Attaching and recovering a direct worktree | Complete | PASS (28 tests) | `f13fbc7` | Attach, repair and clean-only release with interrupted-release recovery |
 
 ## CH1-01 verification
 
@@ -46,7 +46,7 @@
 - **Regression:** `uv run --python 3.14 python -m unittest discover -s tests -v` — 28 tests passed.
 - **Additional checks:** `uv run --python 3.14 python -m compileall -q factory tests` and `git -c core.whitespace=cr-at-eol diff --check` — passed.
 - **Reviewed scope:** `factory/job.py`, `factory/cli.py`, `tests/test_job_create.py`, `chapter-01.md`, `design-deviations.md`, and this progress record; integration tests use temporary repositories and local bare remotes.
-- **Checkpoint SHA:** pending commit.
+- **Checkpoint SHA:** `f13fbc7`.
 
 ## Checkpoint policy
 
