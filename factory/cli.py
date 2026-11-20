@@ -5,7 +5,15 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from .job import ConfigurationError, FactoryError, create_job, list_jobs, read_job
+from .job import (
+    ConfigurationError,
+    FactoryError,
+    create_job,
+    list_jobs,
+    read_job,
+    resume_job,
+    transition_job,
+)
 
 
 def _parser():
@@ -18,6 +26,13 @@ def _parser():
     new.add_argument("--title", required=True)
     status = job_commands.add_parser("status")
     status.add_argument("job_id")
+    transition = job_commands.add_parser("transition")
+    transition.add_argument("job_id")
+    transition.add_argument("target", choices=("NEEDS_HUMAN", "FAILED"))
+    transition.add_argument("--reason", required=True)
+    resume = job_commands.add_parser("resume")
+    resume.add_argument("job_id")
+    resume.add_argument("--reason", required=True)
     job_commands.add_parser("list")
     return parser
 
@@ -29,6 +44,10 @@ def main(argv=None):
             result = create_job(Path.cwd(), args.project, args.title)
         elif args.job_command == "status":
             result = read_job(Path.cwd(), args.job_id)
+        elif args.job_command == "transition":
+            result = transition_job(Path.cwd(), args.job_id, args.target, args.reason)
+        elif args.job_command == "resume":
+            result = resume_job(Path.cwd(), args.job_id, args.reason)
         else:
             result = list_jobs(Path.cwd())
     except (ConfigurationError, ValidationError) as error:
