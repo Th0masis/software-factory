@@ -1,0 +1,11 @@
+# Runtime data
+/jobs/*
+!/jobs/.gitkeep
+/worktrees/*
+!/worktrees/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
