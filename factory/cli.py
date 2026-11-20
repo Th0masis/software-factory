@@ -8,9 +8,12 @@ from pydantic import ValidationError
 from .job import (
     ConfigurationError,
     FactoryError,
+    attach_worktree,
     create_job,
     list_jobs,
     read_job,
+    release_worktree,
+    repair_worktree,
     resume_job,
     transition_job,
 )
@@ -33,6 +36,17 @@ def _parser():
     resume = job_commands.add_parser("resume")
     resume.add_argument("job_id")
     resume.add_argument("--reason", required=True)
+    worktree = job_commands.add_parser("worktree")
+    worktree_commands = worktree.add_subparsers(
+        dest="worktree_command", required=True
+    )
+    attach = worktree_commands.add_parser("attach")
+    attach.add_argument("job_id")
+    attach.add_argument("--branch", required=True)
+    repair = worktree_commands.add_parser("repair")
+    repair.add_argument("job_id")
+    release = worktree_commands.add_parser("release")
+    release.add_argument("job_id")
     job_commands.add_parser("list")
     return parser
 
@@ -48,6 +62,13 @@ def main(argv=None):
             result = transition_job(Path.cwd(), args.job_id, args.target, args.reason)
         elif args.job_command == "resume":
             result = resume_job(Path.cwd(), args.job_id, args.reason)
+        elif args.job_command == "worktree":
+            if args.worktree_command == "attach":
+                result = attach_worktree(Path.cwd(), args.job_id, args.branch)
+            elif args.worktree_command == "repair":
+                result = repair_worktree(Path.cwd(), args.job_id)
+            else:
+                result = release_worktree(Path.cwd(), args.job_id)
         else:
             result = list_jobs(Path.cwd())
     except (ConfigurationError, ValidationError) as error:

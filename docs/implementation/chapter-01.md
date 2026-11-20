@@ -120,6 +120,7 @@ Initial state is `DRAFT_SPEC`. Normal forward transitions follow the pipeline in
 - Attach rejects invalid refs, missing local branches, branches already checked out in any worktree, occupied paths, and mismatched project identities. A remote-tracking-only branch must first be checked out by a person.
 - Attach fetches the configured base remote, records `base_sha` and the selected branch's current `work_branch_start_sha`, then attaches the branch at the registered factory worktree path. It never creates or resets a branch.
 - Persist an attach intent before Git side effects. `repair` is idempotent for an interrupted/missing registered worktree: validate ownership and reattach the same branch at its current HEAD, without fetch/reset or deleting anything. Collisions fail closed.
+- Persist a release intent before removing a worktree. If `repair` finds a job in `releasing`, it removes the still-registered worktree only if clean, or completes the journal if Git already removed it. A missing path that Git still registers fails closed.
 - A failure or budget event preserves committed and uncommitted work and sends the job to `NEEDS_HUMAN`. No automatic rollback or branch reset.
 - `release` is explicit and succeeds only for a clean registered worktree. It removes the worktree without force and keeps the branch. Dirty worktrees are refused. No automatic release.
 - Git failures, lock failures, invalid config, missing jobs, corrupt event logs, illegal transitions, and failed snapshot recovery are surfaced explicitly. A failed cleanup is reported alongside the original error; it is never reported as successful.
@@ -155,10 +156,10 @@ Each slice follows RED → GREEN → REFACTOR. Its progress entry is updated bef
 - **Observable behavior:** after spec approval, the factory attaches a person-prepared local branch; repair is safe/idempotent; release removes only a clean worktree and retains its branch.
 - **Inputs/outputs:** job ID and local branch; project remote/base config; recorded `base_sha`, `work_branch_start_sha`, path, status, and events.
 - **Failing test first:** use a temporary Git repository with a local branch; assert attach succeeds only when eligible and does not create/change the branch ref.
-- **Acceptance:** missing/invalid/already-checked-out branch and path collision fail without modifying user work; interrupted attach repairs from the existing branch; dirty release fails; clean release leaves the branch intact; no reset/delete/force operation is invoked.
+- **Acceptance:** missing/invalid/already-checked-out branch and path collision fail without modifying user work; interrupted attach repairs from the existing branch; dirty release fails; clean release leaves the branch intact; interrupted release is safely completed before or after Git removal; no reset/delete/force operation is invoked.
 - **Minimal scope:** Git argument-array helper, attach/repair/release operations, worktree status in job snapshot/events, temporary-repository integration tests.
 - **Dependencies:** CH1-01 and CH1-02.
-- **Verification:** Git integration tests in temporary repositories, including interrupted operation and negative cases; no network credentials or production repositories.
+- **Verification:** Git integration tests in temporary repositories, including interrupted attach/release before and after side effects and negative cases; no network credentials or production repositories.
 - **Completion:** all positive, negative, and recovery tests pass; progress records commit SHA and clean slice diff.
 
 ## 4. Verification strategy

@@ -24,6 +24,7 @@ Statuses:
 | DD-12 | Chapter 1 CLI proposal | Output/error shapes and numeric exit-code categories are unspecified. | Success is JSON on stdout; errors go to stderr; exit `2` means usage/configuration error and `1` means operational failure. | Resolved in the Chapter 1 contract |
 | DD-13 | Chapter 1 factory config | The config location is known, but factory-root discovery is unspecified. | The CLI runs from the factory repository root; the current working directory is the factory root for `config.json` and relative data paths. | Resolved |
 | DD-14 | D14 `.factory/project.json` | The project config proposes a `work_branch` template. | The person prepares the exact local branch after spec approval and passes it to `worktree attach`; no branch template or automatic branch creation is used initially. | Resolved; branch-per-job remains deferred |
+| DD-15 | Chapter 1 worktree release | Interrupted release recovery is not specified. | CH1-03 journals a release intent before Git removal; `repair` safely completes removal or finalizes the journal if Git already removed the worktree. A missing path that Git still registers fails closed. | Resolved; approved during CH1-03 implementation |
 
 ## Review workflow
 

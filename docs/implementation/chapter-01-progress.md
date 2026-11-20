@@ -1,6 +1,6 @@
 # Chapter 1 — Progress
 
-- **Overall status:** CH1-01 and CH1-02 complete; CH1-03 not started.
+- **Overall status:** CH1-01 and CH1-02 complete; CH1-03 verified, checkpoint commit pending.
 - **Current branch:** `docs/chapter-01-contract`
 - **Contract:** [`chapter-01.md`](./chapter-01.md)
 - **Design deltas:** [`design-deviations.md`](./design-deviations.md)
@@ -9,7 +9,7 @@
 
 - **Completed:** Chapter 1 specification review and contract approval; CH1-01 metadata-only job creation, `status`, and `list`.
 - **Verified:** CH1-01 and CH1-02 acceptance checks pass; all tests use temporary repositories.
-- **Remaining:** Implement CH1-03. TDD test authorship remains deferred to Chapter 6.
+- **Remaining:** Record the CH1-03 checkpoint SHA. TDD test authorship remains deferred to Chapter 6.
 - **Blockers:** None.
 
 ## Slice status
@@ -18,7 +18,7 @@
 |---|---|---|---|---|
 | CH1-01 — Creating metadata-only jobs | Complete | PASS (8 tests) | `4be2bde` | Metadata-only creation and public CLI queries |
 | CH1-02 — Enforcing transitions and journal recovery | Complete | PASS (18 tests) | `7aed742` | Escalation/resume, validated journal replay, recovery, and process lock |
-| CH1-03 — Attaching and recovering a direct worktree | Not started | — | — | Depends on CH1-01 and CH1-02 |
+| CH1-03 — Attaching and recovering a direct worktree | Verified; checkpoint pending | PASS (28 tests) | — | Attach, repair and clean-only release with interrupted-release recovery |
 
 ## CH1-01 verification
 
@@ -36,6 +36,17 @@
 - **Recovery coverage:** Stale/invalid snapshots are rebuilt; incomplete/corrupt journal tails fail closed; event-committed/snapshot-failed state changes recover from the journal.
 - **Reviewed scope:** CLI, state/event handling, per-job locking, focused temporary-repository tests, and this progress record.
 - **Checkpoint SHA:** `7aed742`.
+
+## CH1-03 verification
+
+- **RED commands:** `uv run --python 3.14 python -m unittest tests.test_job_create.JobCreateCliTests.test_worktree_attach_uses_existing_approved_local_branch -v` (missing command); `uv run --python 3.14 python -m unittest tests.test_job_create.JobCreateCliTests.test_worktree_repair_reattaches_missing_worktree_at_current_branch_head -v` (missing command); `uv run --python 3.14 python -m unittest tests.test_job_create.JobCreateCliTests.test_worktree_release_refuses_dirty_worktree_without_changing_it -v` (release unavailable); and `uv run --python 3.14 python -m unittest tests.test_job_create.JobCreateCliTests.test_worktree_repair_completes_interrupted_release tests.test_job_create.JobCreateCliTests.test_worktree_repair_finalizes_release_after_git_removal -v` (unsupported `releasing` journal state).
+- **GREEN:** Added `attach`, `repair`, and `release`; release now journals its intent and repair completes a still-registered clean worktree or finalizes the journal after Git removal.
+- **Acceptance coverage:** Attach requires `SPEC_APPROVED`, uses an existing local branch without changing its ref, and rejects invalid/missing/already-checked-out branches and occupied paths. Repair reattaches the existing branch at its current HEAD, does not fetch or reset, is idempotent, and preserves unregistered path collisions. Release refuses dirty worktrees without changing their files/state; clean release removes the registered worktree and retains its branch. Interrupted release recovery is tested before/after Git removal, and a missing path still registered by Git fails closed.
+- **Targeted GREEN commands:** `uv run --python 3.14 python -m unittest tests.test_job_create.JobCreateCliTests.test_worktree_repair_completes_interrupted_release tests.test_job_create.JobCreateCliTests.test_worktree_repair_finalizes_release_after_git_removal tests.test_job_create.JobCreateCliTests.test_worktree_release_refuses_dirty_worktree_without_changing_it tests.test_job_create.JobCreateCliTests.test_worktree_release_removes_clean_worktree_and_keeps_branch -v` and `uv run --python 3.14 python -m unittest tests.test_job_create.JobCreateCliTests.test_worktree_repair_rejects_missing_but_registered_release_path -v` — passed.
+- **Regression:** `uv run --python 3.14 python -m unittest discover -s tests -v` — 28 tests passed.
+- **Additional checks:** `uv run --python 3.14 python -m compileall -q factory tests` and `git -c core.whitespace=cr-at-eol diff --check` — passed.
+- **Reviewed scope:** `factory/job.py`, `factory/cli.py`, `tests/test_job_create.py`, `chapter-01.md`, `design-deviations.md`, and this progress record; integration tests use temporary repositories and local bare remotes.
+- **Checkpoint SHA:** pending commit.
 
 ## Checkpoint policy
 

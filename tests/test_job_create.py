@@ -89,6 +89,58 @@ class JobCreateCliTests(unittest.TestCase):
             text=True,
         )
 
+    def _prepare_approved_worktree_job(self, temp_root, branch="feature/widget"):
+        factory_root, target_repo, env = self._prepare_repositories(temp_root)
+        subprocess.run(
+            ["git", "add", ".factory/project.json"], cwd=target_repo, check=True
+        )
+        subprocess.run(
+            ["git", "commit", "--quiet", "-m", "add project configuration"],
+            cwd=target_repo,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "push", "--quiet", "origin", "main"],
+            cwd=target_repo,
+            check=True,
+        )
+        subprocess.run(["git", "branch", branch], cwd=target_repo, check=True)
+        subprocess.run(["git", "checkout", "--quiet", branch], cwd=target_repo, check=True)
+        (target_repo / "feature.txt").write_text("feature\n", encoding="utf-8")
+        subprocess.run(["git", "add", "feature.txt"], cwd=target_repo, check=True)
+        subprocess.run(
+            ["git", "commit", "--quiet", "-m", "prepare feature branch"],
+            cwd=target_repo,
+            check=True,
+        )
+        subprocess.run(["git", "checkout", "--quiet", "main"], cwd=target_repo, check=True)
+        branch_sha = subprocess.run(
+            ["git", "rev-parse", f"refs/heads/{branch}"],
+            cwd=target_repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        created = self._run_cli(
+            factory_root,
+            env,
+            "job",
+            "new",
+            "--project",
+            str(target_repo),
+            "--title",
+            "Repair widget",
+        )
+        job_id = json.loads(created.stdout)["job_id"]
+        current = job_service.read_job(factory_root, job_id)
+        job_service._record_state_change(
+            factory_root / "jobs" / job_id,
+            current,
+            "SPEC_APPROVED",
+            "Spec approved for worktree test",
+        )
+        return factory_root, target_repo, env, job_id, branch, branch_sha
+
     def test_new_creates_metadata_without_branch_or_worktree(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             factory_root, target_repo, env = self._prepare_repositories(Path(temp_dir))
@@ -119,6 +171,536 @@ class JobCreateCliTests(unittest.TestCase):
             self.assertEqual(job["worktree_status"], "not_attached")
             self.assertEqual(events[0]["type"], "JOB_CREATED")
             self.assertFalse((factory_root / "worktrees").exists())
+
+    def test_worktree_attach_uses_existing_approved_local_branch(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (
+                factory_root,
+                target_repo,
+                env,
+                job_id,
+                branch,
+                branch_sha,
+            ) = self._prepare_approved_worktree_job(Path(temp_dir))
+
+            result = self._run_cli(
+                factory_root,
+                env,
+                "job",
+                "worktree",
+                "attach",
+                job_id,
+                "--branch",
+                branch,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            output = json.loads(result.stdout)
+            self.assertEqual(output["job"]["state"], "SPEC_APPROVED")
+            self.assertEqual(output["job"]["work_branch"], branch)
+            self.assertEqual(output["job"]["work_branch_start_sha"], branch_sha)
+            base_sha = subprocess.run(
+                ["git", "rev-parse", "refs/remotes/origin/main"],
+                cwd=target_repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            self.assertEqual(output["job"]["base_sha"], base_sha)
+            self.assertNotEqual(base_sha, branch_sha)
+            self.assertEqual(output["job"]["worktree_status"], "attached")
+            worktree_path = Path(output["job"]["worktree_path"])
+            self.assertEqual(
+                worktree_path,
+                factory_root / "worktrees" / "test-project" / job_id,
+            )
+            checked_out_branch = subprocess.run(
+                ["git", "branch", "--show-current"],
+                cwd=worktree_path,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            self.assertEqual(checked_out_branch, branch)
+            current_branch_sha = subprocess.run(
+                ["git", "rev-parse", f"refs/heads/{branch}"],
+                cwd=target_repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            self.assertEqual(current_branch_sha, branch_sha)
+
+    def test_worktree_attach_requires_approved_spec(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            factory_root, target_repo, env = self._prepare_repositories(Path(temp_dir))
+            created = self._run_cli(
+                factory_root,
+                env,
+                "job",
+                "new",
+                "--project",
+                str(target_repo),
+                "--title",
+                "Repair widget",
+            )
+            job_id = json.loads(created.stdout)["job_id"]
+
+            result = self._run_cli(
+                factory_root,
+                env,
+                "job",
+                "worktree",
+                "attach",
+                job_id,
+                "--branch",
+                "feature/widget",
+            )
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("requires SPEC_APPROVED", result.stderr)
+            status = self._run_cli(factory_root, env, "job", "status", job_id)
+            self.assertEqual(json.loads(status.stdout)["job"]["state"], "DRAFT_SPEC")
+            self.assertFalse((factory_root / "worktrees").exists())
+
+    def test_worktree_attach_rejects_invalid_branch_and_occupied_path(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (
+                factory_root,
+                _,
+                env,
+                job_id,
+                branch,
+                _,
+            ) = self._prepare_approved_worktree_job(Path(temp_dir))
+
+            for requested_branch, expected_code, diagnostic in (
+                ("../main", 2, "invalid local branch"),
+                ("feature/missing", 1, "local branch does not exist"),
+                ("main", 1, "already checked out"),
+            ):
+                with self.subTest(branch=requested_branch):
+                    result = self._run_cli(
+                        factory_root,
+                        env,
+                        "job",
+                        "worktree",
+                        "attach",
+                        job_id,
+                        "--branch",
+                        requested_branch,
+                    )
+                    self.assertEqual(result.returncode, expected_code)
+                    self.assertIn(diagnostic, result.stderr)
+
+            worktree_path = factory_root / "worktrees" / "test-project" / job_id
+            worktree_path.mkdir(parents=True)
+            sentinel = worktree_path / "do-not-remove.txt"
+            sentinel.write_text("preserve\n", encoding="utf-8")
+            result = self._run_cli(
+                factory_root,
+                env,
+                "job",
+                "worktree",
+                "attach",
+                job_id,
+                "--branch",
+                branch,
+            )
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("worktree path already exists", result.stderr)
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "preserve\n")
+            status = self._run_cli(factory_root, env, "job", "status", job_id)
+            self.assertEqual(
+                json.loads(status.stdout)["job"]["worktree_status"], "not_attached"
+            )
+
+    def test_worktree_repair_reattaches_missing_worktree_at_current_branch_head(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (
+                factory_root,
+                target_repo,
+                env,
+                job_id,
+                branch,
+                branch_sha,
+            ) = self._prepare_approved_worktree_job(Path(temp_dir))
+            attached = self._run_cli(
+                factory_root,
+                env,
+                "job",
+                "worktree",
+                "attach",
+                job_id,
+                "--branch",
+                branch,
+            )
+            self.assertEqual(attached.returncode, 0, attached.stderr)
+            worktree_path = Path(json.loads(attached.stdout)["job"]["worktree_path"])
+            (worktree_path / "recovery.txt").write_text("committed\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "add", "recovery.txt"], cwd=worktree_path, check=True
+            )
+            subprocess.run(
+                ["git", "commit", "--quiet", "-m", "preserve branch work"],
+                cwd=worktree_path,
+                check=True,
+            )
+            expected_head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=worktree_path,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            subprocess.run(
+                ["git", "worktree", "remove", str(worktree_path)],
+                cwd=target_repo,
+                check=True,
+            )
+            cached_base_sha = subprocess.run(
+                ["git", "rev-parse", "refs/remotes/origin/main"],
+                cwd=target_repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            (target_repo / "remote-update.txt").write_text("new base\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "add", "remote-update.txt"], cwd=target_repo, check=True
+            )
+            subprocess.run(
+                ["git", "commit", "--quiet", "-m", "advance remote base"],
+                cwd=target_repo,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "push", "--quiet", "origin", "main"],
+                cwd=target_repo,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "update-ref", "refs/remotes/origin/main", cached_base_sha],
+                cwd=target_repo,
+                check=True,
+            )
+
+            repaired = self._run_cli(
+                factory_root,
+                env,
+                "job",
+                "worktree",
+                "repair",
+                job_id,
+            )
+
+            self.assertEqual(repaired.returncode, 0, repaired.stderr)
+            job = json.loads(repaired.stdout)["job"]
+            self.assertEqual(job["worktree_status"], "attached")
+            self.assertEqual(job["work_branch_start_sha"], branch_sha)
+            self.assertEqual(job["base_sha"], cached_base_sha)
+            self.assertEqual(
+                subprocess.run(
+                    ["git", "rev-parse", "refs/remotes/origin/main"],
+                    cwd=target_repo,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip(),
+                cached_base_sha,
+            )
+            repaired_head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=worktree_path,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            self.assertEqual(repaired_head, expected_head)
+            second_repair = self._run_cli(
+                factory_root,
+                env,
+                "job",
+                "worktree",
+                "repair",
+                job_id,
+            )
+            self.assertEqual(second_repair.returncode, 0, second_repair.stderr)
+            self.assertEqual(json.loads(second_repair.stdout)["last_event"]["seq"], 6)
+
+    def test_worktree_release_refuses_dirty_worktree_without_changing_it(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (
+                factory_root,
+                target_repo,
+                env,
+                job_id,
+                branch,
+                _,
+            ) = self._prepare_approved_worktree_job(Path(temp_dir))
+            attached = self._run_cli(
+                factory_root,
+                env,
+                "job",
+                "worktree",
+                "attach",
+                job_id,
+                "--branch",
+                branch,
+            )
+            worktree_path = Path(json.loads(attached.stdout)["job"]["worktree_path"])
+            dirty_file = worktree_path / "uncommitted.txt"
+            dirty_file.write_text("preserve\n", encoding="utf-8")
+
+            released = self._run_cli(
+                factory_root, env, "job", "worktree", "release", job_id
+            )
+
+            self.assertEqual(released.returncode, 1)
+            self.assertIn("uncommitted changes", released.stderr)
+            self.assertEqual(dirty_file.read_text(encoding="utf-8"), "preserve\n")
+            status = self._run_cli(factory_root, env, "job", "status", job_id)
+            self.assertEqual(
+                json.loads(status.stdout)["job"]["worktree_status"], "attached"
+            )
+            self.assertTrue(worktree_path.exists())
+
+    def test_worktree_repair_completes_interrupted_release(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (
+                factory_root,
+                target_repo,
+                env,
+                job_id,
+                branch,
+                branch_sha,
+            ) = self._prepare_approved_worktree_job(Path(temp_dir))
+            attached = self._run_cli(
+                factory_root,
+                env,
+                "job",
+                "worktree",
+                "attach",
+                job_id,
+                "--branch",
+                branch,
+            )
+            worktree_path = Path(json.loads(attached.stdout)["job"]["worktree_path"])
+            current = job_service.read_job(factory_root, job_id)
+            job_service._record_worktree_event(
+                factory_root / "jobs" / job_id,
+                current,
+                "WORKTREE_RELEASE_STARTED",
+                "Simulate interrupted release before Git removal",
+                {"worktree_status": "releasing"},
+            )
+
+            repaired = self._run_cli(
+                factory_root, env, "job", "worktree", "repair", job_id
+            )
+
+            self.assertEqual(repaired.returncode, 0, repaired.stderr)
+            output = json.loads(repaired.stdout)
+            self.assertEqual(output["job"]["worktree_status"], "released")
+            self.assertEqual(output["last_event"]["type"], "WORKTREE_RELEASED")
+            self.assertFalse(worktree_path.exists())
+            self.assertEqual(
+                subprocess.run(
+                    ["git", "rev-parse", f"refs/heads/{branch}"],
+                    cwd=target_repo,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip(),
+                branch_sha,
+            )
+
+    def test_worktree_repair_finalizes_release_after_git_removal(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (
+                factory_root,
+                target_repo,
+                env,
+                job_id,
+                branch,
+                branch_sha,
+            ) = self._prepare_approved_worktree_job(Path(temp_dir))
+            attached = self._run_cli(
+                factory_root,
+                env,
+                "job",
+                "worktree",
+                "attach",
+                job_id,
+                "--branch",
+                branch,
+            )
+            worktree_path = Path(json.loads(attached.stdout)["job"]["worktree_path"])
+            current = job_service.read_job(factory_root, job_id)
+            job_service._record_worktree_event(
+                factory_root / "jobs" / job_id,
+                current,
+                "WORKTREE_RELEASE_STARTED",
+                "Simulate interrupted release after Git removal",
+                {"worktree_status": "releasing"},
+            )
+            subprocess.run(
+                ["git", "worktree", "remove", str(worktree_path)],
+                cwd=target_repo,
+                check=True,
+            )
+
+            repaired = self._run_cli(
+                factory_root, env, "job", "worktree", "repair", job_id
+            )
+
+            self.assertEqual(repaired.returncode, 0, repaired.stderr)
+            output = json.loads(repaired.stdout)
+            self.assertEqual(output["job"]["worktree_status"], "released")
+            self.assertEqual(output["last_event"]["type"], "WORKTREE_RELEASED")
+            self.assertFalse(worktree_path.exists())
+            self.assertEqual(
+                subprocess.run(
+                    ["git", "rev-parse", f"refs/heads/{branch}"],
+                    cwd=target_repo,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip(),
+                branch_sha,
+            )
+
+    def test_worktree_repair_rejects_missing_but_registered_release_path(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (
+                factory_root,
+                _,
+                env,
+                job_id,
+                branch,
+                _,
+            ) = self._prepare_approved_worktree_job(Path(temp_dir))
+            attached = self._run_cli(
+                factory_root,
+                env,
+                "job",
+                "worktree",
+                "attach",
+                job_id,
+                "--branch",
+                branch,
+            )
+            worktree_path = Path(json.loads(attached.stdout)["job"]["worktree_path"])
+            current = job_service.read_job(factory_root, job_id)
+            job_service._record_worktree_event(
+                factory_root / "jobs" / job_id,
+                current,
+                "WORKTREE_RELEASE_STARTED",
+                "Simulate interrupted release",
+                {"worktree_status": "releasing"},
+            )
+            preserved_path = worktree_path.with_name("moved-worktree")
+            worktree_path.rename(preserved_path)
+
+            repaired = self._run_cli(
+                factory_root, env, "job", "worktree", "repair", job_id
+            )
+
+            self.assertEqual(repaired.returncode, 1)
+            self.assertIn("remains registered", repaired.stderr)
+            self.assertEqual(
+                (preserved_path / "feature.txt").read_text(encoding="utf-8"),
+                "feature\n",
+            )
+            status = self._run_cli(factory_root, env, "job", "status", job_id)
+            self.assertEqual(
+                json.loads(status.stdout)["job"]["worktree_status"], "releasing"
+            )
+
+    def test_worktree_repair_preserves_unregistered_path_collision(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (
+                factory_root,
+                target_repo,
+                env,
+                job_id,
+                branch,
+                _,
+            ) = self._prepare_approved_worktree_job(Path(temp_dir))
+            attached = self._run_cli(
+                factory_root,
+                env,
+                "job",
+                "worktree",
+                "attach",
+                job_id,
+                "--branch",
+                branch,
+            )
+            worktree_path = Path(json.loads(attached.stdout)["job"]["worktree_path"])
+            subprocess.run(
+                ["git", "worktree", "remove", str(worktree_path)],
+                cwd=target_repo,
+                check=True,
+            )
+            worktree_path.mkdir()
+            sentinel = worktree_path / "preserve.txt"
+            sentinel.write_text("not factory-owned\n", encoding="utf-8")
+
+            repaired = self._run_cli(
+                factory_root, env, "job", "worktree", "repair", job_id
+            )
+
+            self.assertEqual(repaired.returncode, 1)
+            self.assertIn("worktree ownership mismatch", repaired.stderr)
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "not factory-owned\n")
+            status = self._run_cli(factory_root, env, "job", "status", job_id)
+            self.assertEqual(
+                json.loads(status.stdout)["job"]["worktree_status"], "attached"
+            )
+
+    def test_worktree_release_removes_clean_worktree_and_keeps_branch(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (
+                factory_root,
+                target_repo,
+                env,
+                job_id,
+                branch,
+                branch_sha,
+            ) = self._prepare_approved_worktree_job(Path(temp_dir))
+            attached = self._run_cli(
+                factory_root,
+                env,
+                "job",
+                "worktree",
+                "attach",
+                job_id,
+                "--branch",
+                branch,
+            )
+            worktree_path = Path(json.loads(attached.stdout)["job"]["worktree_path"])
+
+            released = self._run_cli(
+                factory_root, env, "job", "worktree", "release", job_id
+            )
+
+            self.assertEqual(released.returncode, 0, released.stderr)
+            output = json.loads(released.stdout)
+            self.assertEqual(output["job"]["worktree_status"], "released")
+            self.assertEqual(output["last_event"]["type"], "WORKTREE_RELEASED")
+            self.assertFalse(worktree_path.exists())
+            self.assertEqual(
+                subprocess.run(
+                    ["git", "rev-parse", f"refs/heads/{branch}"],
+                    cwd=target_repo,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip(),
+                branch_sha,
+            )
 
     def test_status_returns_job_and_last_event(self):
         with tempfile.TemporaryDirectory() as temp_dir:
