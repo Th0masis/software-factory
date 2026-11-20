@@ -16,7 +16,7 @@
 
 | Slice | Status | Tests | Commit SHA | Notes |
 |---|---|---|---|---|
-| CH1-01 — Creating metadata-only jobs | Complete | PASS (8 tests) | Pending checkpoint | Metadata-only creation and public CLI queries |
+| CH1-01 — Creating metadata-only jobs | Complete | PASS (8 tests) | `4be2bde` | Metadata-only creation and public CLI queries |
 | CH1-02 — Enforcing transitions and journal recovery | Not started | — | — | Depends on CH1-01 |
 | CH1-03 — Attaching and recovering a direct worktree | Not started | — | — | Depends on CH1-01 and CH1-02 |
 
@@ -26,7 +26,7 @@
 - **GREEN/regression:** `uv run --python 3.14 python -m unittest discover -s tests -v` — 8 tests passed.
 - **Additional check:** `uv run --python 3.14 python -m compileall -q factory tests` — passed.
 - **Reviewed scope:** CLI/package setup, strict config and job creation, temporary-repository CLI tests, factory config, ignore rule, and this contract/progress/deviation documentation.
-- **Checkpoint SHA:** To be recorded after the CH1-01 commit.
+- **Checkpoint SHA:** `4be2bde`.
 
 ## Checkpoint policy
 
