@@ -1,6 +1,6 @@
 # Chapter 1 — Progress
 
-- **Overall status:** CH1-01 complete; CH1-02 verified, checkpoint commit pending.
+- **Overall status:** CH1-01 and CH1-02 complete; CH1-03 not started.
 - **Current branch:** `docs/chapter-01-contract`
 - **Contract:** [`chapter-01.md`](./chapter-01.md)
 - **Design deltas:** [`design-deviations.md`](./design-deviations.md)
@@ -9,7 +9,7 @@
 
 - **Completed:** Chapter 1 specification review and contract approval; CH1-01 metadata-only job creation, `status`, and `list`.
 - **Verified:** CH1-01 and CH1-02 acceptance checks pass; all tests use temporary repositories.
-- **Remaining:** Record the CH1-02 checkpoint SHA, then implement CH1-03. TDD test authorship remains deferred to Chapter 6.
+- **Remaining:** Implement CH1-03. TDD test authorship remains deferred to Chapter 6.
 - **Blockers:** None.
 
 ## Slice status
@@ -17,7 +17,7 @@
 | Slice | Status | Tests | Commit SHA | Notes |
 |---|---|---|---|---|
 | CH1-01 — Creating metadata-only jobs | Complete | PASS (8 tests) | `4be2bde` | Metadata-only creation and public CLI queries |
-| CH1-02 — Enforcing transitions and journal recovery | Verified; commit pending | PASS (18 tests) | Pending checkpoint | Escalation/resume, validated journal replay, recovery, and process lock |
+| CH1-02 — Enforcing transitions and journal recovery | Complete | PASS (18 tests) | `7aed742` | Escalation/resume, validated journal replay, recovery, and process lock |
 | CH1-03 — Attaching and recovering a direct worktree | Not started | — | — | Depends on CH1-01 and CH1-02 |
 
 ## CH1-01 verification
@@ -35,7 +35,7 @@
 - **Additional checks:** `uv run --python 3.14 python -m compileall -q factory tests` and `git -c core.whitespace=cr-at-eol diff --check` — passed.
 - **Recovery coverage:** Stale/invalid snapshots are rebuilt; incomplete/corrupt journal tails fail closed; event-committed/snapshot-failed state changes recover from the journal.
 - **Reviewed scope:** CLI, state/event handling, per-job locking, focused temporary-repository tests, and this progress record.
-- **Checkpoint SHA:** To be recorded after the CH1-02 commit.
+- **Checkpoint SHA:** `7aed742`.
 
 ## Checkpoint policy
 
