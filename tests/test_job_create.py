@@ -316,6 +316,99 @@ class JobCreateCliTests(unittest.TestCase):
                 json.loads(status.stdout)["job"]["worktree_status"], "not_attached"
             )
 
+    def test_worktree_repair_retries_base_fetch_interrupted_during_attach(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (
+                factory_root,
+                target_repo,
+                env,
+                job_id,
+                branch,
+                _,
+            ) = self._prepare_approved_worktree_job(Path(temp_dir))
+            remote_repo = target_repo.parent / "remote.git"
+            cached_base_sha = subprocess.run(
+                ["git", "rev-parse", "refs/heads/main"],
+                cwd=target_repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            subprocess.run(
+                ["git", "update-ref", "refs/remotes/origin/main", cached_base_sha],
+                cwd=target_repo,
+                check=True,
+            )
+            (target_repo / "remote-update.txt").write_text(
+                "new base\n", encoding="utf-8"
+            )
+            subprocess.run(["git", "add", "remote-update.txt"], cwd=target_repo, check=True)
+            subprocess.run(
+                ["git", "commit", "--quiet", "-m", "advance remote base"],
+                cwd=target_repo,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "push", "--quiet", "origin", "main"],
+                cwd=target_repo,
+                check=True,
+            )
+            expected_base_sha = subprocess.run(
+                ["git", "rev-parse", "refs/heads/main"],
+                cwd=target_repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            subprocess.run(
+                ["git", "update-ref", "refs/remotes/origin/main", cached_base_sha],
+                cwd=target_repo,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "remote", "set-url", "origin", str(remote_repo) + "-offline"],
+                cwd=target_repo,
+                check=True,
+            )
+
+            attached = self._run_cli(
+                factory_root,
+                env,
+                "job",
+                "worktree",
+                "attach",
+                job_id,
+                "--branch",
+                branch,
+            )
+
+            self.assertEqual(attached.returncode, 1)
+            interrupted = self._run_cli(factory_root, env, "job", "status", job_id)
+            interrupted_job = json.loads(interrupted.stdout)["job"]
+            self.assertEqual(interrupted_job["worktree_status"], "attaching")
+            self.assertIsNone(interrupted_job["base_sha"])
+
+            subprocess.run(
+                ["git", "remote", "set-url", "origin", str(remote_repo)],
+                cwd=target_repo,
+                check=True,
+            )
+            repaired = self._run_cli(
+                factory_root,
+                env,
+                "job",
+                "worktree",
+                "repair",
+                job_id,
+            )
+
+            self.assertEqual(repaired.returncode, 0, repaired.stderr)
+            job = json.loads(repaired.stdout)["job"]
+            self.assertEqual(job["worktree_status"], "attached")
+            self.assertEqual(job["base_sha"], expected_base_sha)
+            self.assertNotEqual(job["base_sha"], cached_base_sha)
+            self.assertTrue(Path(job["worktree_path"]).exists())
+
     def test_worktree_repair_reattaches_missing_worktree_at_current_branch_head(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             (

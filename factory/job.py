@@ -721,6 +721,30 @@ def _finish_worktree_release(project_root, worktree_path, branch, entries):
     )
 
 
+def _fetch_base_branch(project_root, project_config):
+    base_ref = (
+        f"refs/heads/{project_config.base_branch}:"
+        f"refs/remotes/{project_config.remote}/{project_config.base_branch}"
+    )
+    _run_git(
+        project_root,
+        ["fetch", "--no-tags", project_config.remote, base_ref],
+        "fetch configured base branch",
+    )
+    return _run_git(
+        project_root,
+        [
+            "rev-parse",
+            "--verify",
+            (
+                f"refs/remotes/{project_config.remote}/"
+                f"{project_config.base_branch}^{{commit}}"
+            ),
+        ],
+        "resolve fetched base branch",
+    )
+
+
 def attach_worktree(factory_root, job_id, branch):
     job_id, job_dir = _job_location(factory_root, job_id)
     factory_root = factory_root.resolve()
@@ -784,24 +808,7 @@ def attach_worktree(factory_root, job_id, branch):
             },
         )
 
-        base_ref = (
-            f"refs/heads/{project_config.base_branch}:"
-            f"refs/remotes/{project_config.remote}/{project_config.base_branch}"
-        )
-        _run_git(
-            project_root,
-            ["fetch", "--no-tags", project_config.remote, base_ref],
-            "fetch configured base branch",
-        )
-        base_sha = _run_git(
-            project_root,
-            [
-                "rev-parse",
-                "--verify",
-                f"refs/remotes/{project_config.remote}/{project_config.base_branch}^{{commit}}",
-            ],
-            "resolve fetched base branch",
-        )
+        base_sha = _fetch_base_branch(project_root, project_config)
         current = _record_worktree_event(
             job_dir,
             current,
@@ -891,23 +898,12 @@ def repair_worktree(factory_root, job_id):
             )
 
         if not job.base_sha:
-            base_sha = _run_git(
-                project_root,
-                [
-                    "rev-parse",
-                    "--verify",
-                    (
-                        f"refs/remotes/{project_config.remote}/"
-                        f"{project_config.base_branch}^{{commit}}"
-                    ),
-                ],
-                "resolve previously fetched base branch",
-            )
+            base_sha = _fetch_base_branch(project_root, project_config)
             current = _record_worktree_event(
                 job_dir,
                 current,
                 "WORKTREE_BASE_FETCHED",
-                "Recovered previously fetched base branch",
+                "Fetched configured base branch during repair",
                 {"base_sha": base_sha},
             )
 

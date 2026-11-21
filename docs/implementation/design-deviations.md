@@ -25,6 +25,7 @@ Statuses:
 | DD-13 | Chapter 1 factory config | The config location is known, but factory-root discovery is unspecified. | The CLI runs from the factory repository root; the current working directory is the factory root for `config.json` and relative data paths. | Resolved |
 | DD-14 | D14 `.factory/project.json` | The project config proposes a `work_branch` template. | The person prepares the exact local branch after spec approval and passes it to `worktree attach`; no branch template or automatic branch creation is used initially. | Resolved; branch-per-job remains deferred |
 | DD-15 | Chapter 1 worktree release | Interrupted release recovery is not specified. | CH1-03 journals a release intent before Git removal; `repair` safely completes removal or finalizes the journal if Git already removed the worktree. A missing path that Git still registers fails closed. | Resolved; approved during CH1-03 implementation |
+| DD-16 | Chapter 1 worktree attach recovery | Repair was specified not to fetch, but an interrupted fetch before `WORKTREE_BASE_FETCHED` leaves no journal evidence that a cached remote-tracking ref is fresh. | If attach recovery has no recorded `base_sha`, repair retries the configured base fetch and records its result before attaching. If `base_sha` is already recorded, repair does not fetch again. Never infer fetch success from a cached ref. | Resolved; approved during CH1-03 follow-up |
 
 ## Review workflow
 
