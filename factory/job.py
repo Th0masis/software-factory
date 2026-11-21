@@ -579,6 +579,15 @@ def read_job(factory_root, job_id):
         return _read_job_contents(job_dir, job_id)
 
 
+def _persist_event(job_dir, event, updated):
+    with (job_dir / "events.jsonl").open("a", encoding="utf-8", newline="\n") as stream:
+        stream.write(json.dumps(event, sort_keys=True) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    _write_snapshot(job_dir / "job.json", updated)
+    return {"job": updated.model_dump(mode="json"), "last_event": event}
+
+
 def _record_state_change(job_dir, current, target, reason, resuming=False):
     job = JobRecord.model_validate(current["job"])
     is_resume = (
@@ -611,12 +620,7 @@ def _record_state_change(job_dir, current, target, reason, resuming=False):
         "data": updated.model_dump(mode="json"),
     }
 
-    with (job_dir / "events.jsonl").open("a", encoding="utf-8", newline="\n") as stream:
-        stream.write(json.dumps(event, sort_keys=True) + "\n")
-        stream.flush()
-        os.fsync(stream.fileno())
-    _write_snapshot(job_dir / "job.json", updated)
-    return {"job": updated.model_dump(mode="json"), "last_event": event}
+    return _persist_event(job_dir, event, updated)
 
 
 def _record_worktree_event(job_dir, current, event_type, reason, changes):
@@ -633,12 +637,7 @@ def _record_worktree_event(job_dir, current, event_type, reason, changes):
         "data": updated.model_dump(mode="json"),
     }
 
-    with (job_dir / "events.jsonl").open("a", encoding="utf-8", newline="\n") as stream:
-        stream.write(json.dumps(event, sort_keys=True) + "\n")
-        stream.flush()
-        os.fsync(stream.fileno())
-    _write_snapshot(job_dir / "job.json", updated)
-    return {"job": updated.model_dump(mode="json"), "last_event": event}
+    return _persist_event(job_dir, event, updated)
 
 
 def _worktree_entries(project_root):
