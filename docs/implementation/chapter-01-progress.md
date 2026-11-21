@@ -48,6 +48,13 @@
 - **Reviewed scope:** `factory/job.py`, `factory/cli.py`, `tests/test_job_create.py`, `chapter-01.md`, `design-deviations.md`, and this progress record; integration tests use temporary repositories and local bare remotes.
 - **Checkpoint SHA:** `f13fbc7`.
 
+## CH1-03 follow-up — interrupted base fetch
+
+- **Decision:** if repair finds no recorded `base_sha`, retry the configured fetch and record its result before attaching; never infer fetch success from a cached remote-tracking ref. Repair does not fetch again when `base_sha` is already recorded.
+- **TDD RED:** `uv run --python 3.14 python -m unittest tests.test_job_create.JobCreateCliTests.test_worktree_repair_retries_base_fetch_interrupted_during_attach -v` — failed because repair recorded the stale cached SHA.
+- **GREEN/regression:** the same focused test passed; `uv run --python 3.14 python -m unittest discover -s tests -v` — 29 tests passed; `uv run --python 3.14 python -m compileall -q factory tests` and `git -c core.whitespace=cr-at-eol diff --check` — passed.
+- **Commits:** `10a0ddd` (behavior-preserving journal persistence refactor), `e673b7b` (fetch retry and regression test).
+
 ## Checkpoint policy
 
 After each slice, record the exact RED/GREEN/regression commands, results, reviewed file list, and verified commit SHA. Commit only after all required tests pass, using a focused Conventional Commit with the slice ID and verification summary in its body. A slice is not complete if a required test fails. Do not amend, push, or merge without explicit approval.
