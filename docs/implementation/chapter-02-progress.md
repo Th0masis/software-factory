@@ -1,15 +1,15 @@
 # Chapter 2 — Progress
 
-- **Overall status:** CH2-01 through CH2-03 complete; CH2-04 in progress; CH2-05 pending.
+- **Overall status:** CH2-01 through CH2-04 complete; CH2-05 pending.
 - **Current branch:** `feature/chapter-02`
 - **Contract:** [`chapter-02.md`](./chapter-02.md)
 - **Design deltas:** [`design-deviations.md`](./design-deviations.md)
 
 ## Checkpoint summary
 
-- **Completed:** Contract approved; CH2-01 command construction and validation; CH2-02 process execution and artifact persistence; CH2-03 usage parsing and outcome classification.
+- **Completed:** Contract approved; CH2-01 command construction and validation; CH2-02 process execution and artifact persistence; CH2-03 usage parsing and outcome classification; CH2-04 preflight and Windows timeout recovery.
 - **Verified:** `config.json` defines the approved tool allow-list, mandatory `shell(git push)` denial, secret environment variable names, and two builder profiles. The installed Copilot CLI supports the required command flags and `--name`.
-- **Remaining:** Complete CH2-04, then CH2-05.
+- **Remaining:** CH2-05 integration contract and regression.
 - **Blockers:** The environment cannot create native file symlinks (`WinError 1314`); the symlink guard passed a filesystem-boundary simulation instead.
 
 ## Slice status
@@ -19,7 +19,7 @@
 | CH2-01 — Validating profiles and constructing a safe command | Complete | PASS (9 focused tests; 1 platform skip) | `d6aed01` | Exact command arguments, profile pinning, permission boundaries, path validation, cap threshold, and unique run directories verified. |
 | CH2-02 — Executing a fake Copilot process and preserving artifacts | Complete | PASS (15 focused tests; 1 platform skip) | `e4ebdbf` | Fake-process success, nonzero exit with partial output, launch failure, and missing-artifact failure. |
 | CH2-03 — Parsing usage and classifying outcomes | Complete | PASS (25 focused tests; 1 platform skip) | `b8552c3` | Usage validation, model matching, budget signals, malformed output, fail-closed cases, and timeout precedence. |
-| CH2-04 — Preflight and Windows timeout recovery | Verification passed; commit pending | PASS (31 focused tests; 1 platform skip) | — | Includes live Windows child-tree termination; probes are mocked in tests. |
+| CH2-04 — Preflight and Windows timeout recovery | Complete | PASS (31 focused tests; 1 platform skip) | `8551d08` | Includes live Windows child-tree termination and approved live preflight probes. |
 | CH2-05 — Runner integration contract and regression | Pending | — | — | |
 
 ## CH2-01 checkpoint
@@ -63,9 +63,8 @@
 - **Implementation:** Windows timeouts now use `taskkill /T /F` to terminate the process tree and return an explicit error if tree termination fails. Preflight validates executable/help flags, probes each distinct configured model in a temporary working directory with only the read tool available, and returns a structured result without touching job state.
 - **Live probe:** `.venv\Scripts\python.exe -c "from factory.runner import preflight; print(preflight())"` — `PreflightResult(ok=True, model=None, error=None)`; the approved live authentication/model checks succeeded.
 - **Additional checks:** `.venv\Scripts\python.exe -m compileall -q factory tests` and `git -c core.whitespace=cr-at-eol diff --check` — passed.
-- **Remaining:** Review the diff and commit CH2-04.
+- **Checkpoint SHA:** `8551d08`.
 - **Reviewed scope:** `factory/runner.py`, `tests/test_runner.py`, and this progress record.
-- **Checkpoint SHA:** Pending.
 
 ## Checkpoint policy
 
