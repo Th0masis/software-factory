@@ -1,8 +1,12 @@
+import json
 import re
 import shutil
 import stat
+import subprocess
+from dataclasses import dataclass
 from itertools import count
 from pathlib import Path
+from typing import Literal
 
 from .job import (
     ConfigurationError,
@@ -24,6 +28,16 @@ _FORBIDDEN_ALLOW_TOOLS = {
     "--allow-all-urls",
     "--yolo",
 }
+
+
+@dataclass(frozen=True)
+class RunResult:
+    outcome: Literal["OK", "BUDGET", "TIMEOUT", "ERROR"]
+    exit_code: int | None
+    usage: dict | None
+    session_id: str | None
+    paths: dict[str, Path]
+    error: str | None
 
 
 def _validate_profile(role, profile, config):
@@ -72,7 +86,7 @@ def _validate_run_inputs(factory_root, config, role, profile, task_file, cwd):
             raise ConfigurationError("task_file must not be a symlink")
         cwd = cwd_path.resolve(strict=True)
         task_file = task_file_path.resolve(strict=True)
-    except OSError as error:
+    except (OSError, TypeError, ValueError) as error:
         raise ConfigurationError(f"invalid runner path: {error}") from error
 
     if not cwd.is_dir():
@@ -130,7 +144,7 @@ def _resolve_executable(executable):
     return str(Path(resolved).resolve())
 
 
-def build_command(
+def _prepare_command(
     role,
     profile,
     task_file,
@@ -192,4 +206,120 @@ def build_command(
     )
     if config.runner.secret_env_vars:
         command.extend(["--secret-env-vars", *config.runner.secret_env_vars])
+    return command, run_dir, config.runner.timeout_seconds, cwd
+
+
+def build_command(
+    role,
+    profile,
+    task_file,
+    cwd,
+    session_name,
+    *,
+    factory_root=None,
+):
+    command, _, _, _ = _prepare_command(
+        role,
+        profile,
+        task_file,
+        cwd,
+        session_name,
+        factory_root=factory_root,
+    )
     return command
+
+
+def run_agent(role, profile, task_file, cwd, session_name):
+    command, run_dir, timeout_seconds, cwd = _prepare_command(
+        role, profile, task_file, cwd, session_name
+    )
+    paths = {
+        "run_dir": run_dir,
+        "stdout": run_dir / "stdout.jsonl",
+        "stderr": run_dir / "stderr.log",
+        "usage": run_dir / "usage.json",
+        "session": run_dir / "session.md",
+    }
+
+    launch_error = None
+    try:
+        with paths["stdout"].open("wb") as stdout, paths["stderr"].open(
+            "wb"
+        ) as stderr:
+            try:
+                process = subprocess.Popen(
+                    command,
+                    cwd=cwd,
+                    stdin=subprocess.DEVNULL,
+                    stdout=stdout,
+                    stderr=stderr,
+                    shell=False,
+                )
+            except OSError as error:
+                launch_error = error
+            else:
+                try:
+                    exit_code = process.wait(timeout=timeout_seconds)
+                    timed_out = False
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                    process.kill()
+                    exit_code = process.wait()
+    except OSError as error:
+        return RunResult(
+            outcome="ERROR",
+            exit_code=None,
+            usage=None,
+            session_id=None,
+            paths=paths,
+            error=f"process or artifact I/O failed: {error}",
+        )
+    if launch_error is not None:
+        return RunResult(
+            outcome="ERROR",
+            exit_code=None,
+            usage=None,
+            session_id=None,
+            paths=paths,
+            error=f"cannot execute Copilot: {launch_error}",
+        )
+
+    artifact_errors = []
+    try:
+        usage = json.loads(paths["usage"].read_text(encoding="utf-8"))
+        if not isinstance(usage, dict):
+            artifact_errors.append("usage.json must contain a JSON object")
+            usage = None
+    except FileNotFoundError:
+        usage = None
+        artifact_errors.append("usage.json was not created")
+    except (OSError, json.JSONDecodeError) as error:
+        usage = None
+        artifact_errors.append(f"cannot read usage.json: {error}")
+    if not paths["session"].is_file():
+        artifact_errors.append("session.md was not created")
+
+    session_id = usage.get("sessionId") if usage else None
+    if not isinstance(session_id, str):
+        session_id = None
+    if timed_out:
+        outcome = "TIMEOUT"
+        error = "Copilot process exceeded the configured timeout"
+    elif exit_code == 0 and not artifact_errors:
+        outcome = "OK"
+        error = None
+    else:
+        outcome = "ERROR"
+        errors = artifact_errors
+        if exit_code != 0:
+            errors = [f"Copilot exited with status {exit_code}", *errors]
+        error = "; ".join(errors) or "Copilot process failed"
+
+    return RunResult(
+        outcome=outcome,
+        exit_code=exit_code,
+        usage=usage,
+        session_id=session_id,
+        paths=paths,
+        error=error,
+    )

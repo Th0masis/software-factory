@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from factory import job as job_service
 from factory.job import ConfigurationError, RunnerProfile
-from factory.runner import build_command
+from factory.runner import build_command, run_agent
 
 
 class RunnerCommandTests(unittest.TestCase):
@@ -196,6 +196,10 @@ class RunnerCommandTests(unittest.TestCase):
         with self.assertRaises(ConfigurationError):
             self._build_command(task_file=task_file)
 
+    def test_build_command_rejects_non_path_task_file(self):
+        with self.assertRaises(ConfigurationError):
+            self._build_command(task_file=17)
+
     def test_build_command_rejects_cwd_outside_worktrees_root(self):
         cwd = self.factory_root / "not-a-worktree"
         cwd.mkdir()
@@ -213,3 +217,119 @@ class RunnerCommandTests(unittest.TestCase):
         self.assertEqual(
             Path(second[second.index("--usage-output-file") + 1]).parent.name, "2"
         )
+
+    def test_run_agent_returns_success_with_persisted_process_artifacts(self):
+        def fake_process(command, cwd, stdin, stdout, stderr, shell):
+            self.assertFalse(shell)
+            stdout.write(b'{"type":"assistant.message","content":"done"}\n')
+            usage_path = Path(command[command.index("--usage-output-file") + 1])
+            usage_path.write_text(
+                json.dumps(
+                    {
+                        "totalNanoAiu": 10,
+                        "currentModel": "claude-sonnet-5.5",
+                        "sessionId": "session-123",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            session_path = Path(command[command.index("--share") + 1])
+            session_path.write_text("# Session output\n", encoding="utf-8")
+            return _CompletedProcess()
+
+        with patch("factory.runner.Path.cwd", return_value=self.factory_root):
+            with patch("factory.runner.subprocess.Popen", side_effect=fake_process):
+                result = run_agent(
+                    "builder",
+                    self.profile,
+                    self.task_file,
+                    self.cwd,
+                    "repair-widget",
+                )
+
+        self.assertEqual(result.outcome, "OK")
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.usage["totalNanoAiu"], 10)
+        self.assertEqual(result.session_id, "session-123")
+        self.assertEqual(
+            result.paths["stdout"].read_text(encoding="utf-8"),
+            '{"type":"assistant.message","content":"done"}\n',
+        )
+        self.assertTrue(result.paths["stderr"].exists())
+        self.assertEqual(
+            result.paths["session"].read_text(encoding="utf-8"),
+            "# Session output\n",
+        )
+
+    def test_run_agent_preserves_partial_artifacts_on_nonzero_exit(self):
+        def fake_process(command, cwd, stdin, stdout, stderr, shell):
+            stdout.write(b'{"type":"assistant.message","content":"partial"}\n')
+            stderr.write(b"process failed\n")
+            return _CompletedProcess(returncode=7)
+
+        with patch("factory.runner.Path.cwd", return_value=self.factory_root):
+            with patch("factory.runner.subprocess.Popen", side_effect=fake_process):
+                result = run_agent(
+                    "builder",
+                    self.profile,
+                    self.task_file,
+                    self.cwd,
+                    "repair-widget",
+                )
+
+        self.assertEqual(result.outcome, "ERROR")
+        self.assertEqual(result.exit_code, 7)
+        self.assertIn("status 7", result.error)
+        self.assertIn("partial", result.paths["stdout"].read_text(encoding="utf-8"))
+        self.assertEqual(
+            result.paths["stderr"].read_text(encoding="utf-8"), "process failed\n"
+        )
+        self.assertFalse(result.paths["usage"].exists())
+        self.assertFalse(result.paths["session"].exists())
+
+    def test_run_agent_reports_process_launch_failure(self):
+        with patch("factory.runner.Path.cwd", return_value=self.factory_root):
+            with patch(
+                "factory.runner.subprocess.Popen",
+                side_effect=OSError("executable unavailable"),
+            ):
+                result = run_agent(
+                    "builder",
+                    self.profile,
+                    self.task_file,
+                    self.cwd,
+                    "repair-widget",
+                )
+
+        self.assertEqual(result.outcome, "ERROR")
+        self.assertIsNone(result.exit_code)
+        self.assertIn("executable unavailable", result.error)
+        self.assertTrue(result.paths["stdout"].is_file())
+        self.assertTrue(result.paths["stderr"].is_file())
+
+    def test_run_agent_fails_when_successful_process_omits_required_artifacts(self):
+        def fake_process(command, cwd, stdin, stdout, stderr, shell):
+            stdout.write(b'{"type":"assistant.message","content":"done"}\n')
+            return _CompletedProcess()
+
+        with patch("factory.runner.Path.cwd", return_value=self.factory_root):
+            with patch("factory.runner.subprocess.Popen", side_effect=fake_process):
+                result = run_agent(
+                    "builder",
+                    self.profile,
+                    self.task_file,
+                    self.cwd,
+                    "repair-widget",
+                )
+
+        self.assertEqual(result.outcome, "ERROR")
+        self.assertIn("usage.json was not created", result.error)
+        self.assertIn("session.md was not created", result.error)
+
+
+class _CompletedProcess:
+    def __init__(self, returncode=0):
+        self.returncode = returncode
+
+    def wait(self, timeout=None):
+        return self.returncode
