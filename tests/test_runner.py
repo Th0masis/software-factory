@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from factory import job as job_service
+from factory import runner as runner_module
 from factory.job import ConfigurationError, RunnerProfile
 from factory.runner import build_command, preflight, run_agent
 
@@ -660,6 +661,45 @@ class RunnerCommandTests(unittest.TestCase):
         self.assertIsNone(result.model)
         self.assertIn("no configured runner models", result.error)
         run.assert_not_called()
+
+    def test_run_agent_leaves_job_journal_unchanged(self):
+        job_dir = self.factory_root / "jobs" / self.job_id
+        job_snapshot = (job_dir / "job.json").read_bytes()
+        event_snapshot = (job_dir / "events.jsonl").read_bytes()
+
+        def fake_process(command, cwd, stdin, stdout, stderr, shell):
+            stdout.write(b'{"type":"assistant.message","content":"done"}\n')
+            Path(command[command.index("--usage-output-file") + 1]).write_text(
+                json.dumps(
+                    {
+                        "totalNanoAiu": 10,
+                        "currentModel": "claude-sonnet-5.5",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            Path(command[command.index("--share") + 1]).write_text(
+                "# Session output\n", encoding="utf-8"
+            )
+            return _CompletedProcess()
+
+        with patch("factory.runner.Path.cwd", return_value=self.factory_root):
+            with patch("factory.runner.subprocess.Popen", side_effect=fake_process):
+                result = runner_module.run_agent(
+                    "builder",
+                    self.profile,
+                    self.task_file,
+                    self.cwd,
+                    "repair-widget",
+                )
+
+        self.assertEqual(result.outcome, "OK")
+        self.assertEqual((job_dir / "job.json").read_bytes(), job_snapshot)
+        self.assertEqual((job_dir / "events.jsonl").read_bytes(), event_snapshot)
+        self.assertEqual(
+            {path.name for path in result.paths["run_dir"].iterdir()},
+            {"stdout.jsonl", "stderr.log", "usage.json", "session.md"},
+        )
 
     def test_run_agent_reports_process_tree_termination_failure(self):
         with patch(
