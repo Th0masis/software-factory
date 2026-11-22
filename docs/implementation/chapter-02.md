@@ -1,6 +1,6 @@
 # Chapter 2 — Implementation Contract
 
-- **Status:** Draft — specification decisions approved; ready for implementation approval
+- **Status:** Approved for implementation — 2026-11-22
 - **Source:** [`design.md`](../../design.md), Chapter 2 and related pipeline, budget, and recovery sections
 - **Dependencies:** [`chapter-01.md`](./chapter-01.md), [`design-deviations.md`](./design-deviations.md)
 

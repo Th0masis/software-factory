@@ -1,4 +1,39 @@
 {
   "jobs_dir": "jobs",
-  "worktrees_dir": "worktrees"
+  "worktrees_dir": "worktrees",
+  "runner": {
+    "executable": "copilot",
+    "timeout_seconds": 1800,
+    "artifacts_dir": "runs",
+    "allow_tools": [
+      "read",
+      "write",
+      "shell(python:*)",
+      "shell(git:*)"
+    ],
+    "deny_tools": [
+      "shell(git push)"
+    ],
+    "secret_env_vars": [
+      "COPILOT_GITHUB_TOKEN",
+      "GH_TOKEN",
+      "GITHUB_TOKEN"
+    ]
+  },
+  "profiles": {
+    "build-low": {
+      "agent": "builder",
+      "model": "claude-haiku-5.5",
+      "effort": "medium",
+      "context": "default",
+      "max_ai_credits": 60
+    },
+    "build-standard": {
+      "agent": "builder",
+      "model": "claude-sonnet-5.5",
+      "effort": "high",
+      "context": "default",
+      "max_ai_credits": 400
+    }
+  }
 }
