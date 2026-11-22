@@ -40,7 +40,8 @@ explicit approval.
 - Job state transitions. The runner reports a result; the owning workflow records any event through
   the Chapter 1 event store.
 - Automatic branch creation, reset, release, push, pull request creation, or merge.
-- Isolated `COPILOT_HOME` or another unverified configuration-directory redirection mechanism.
+- Full configuration isolation through `COPILOT_HOME` or another unverified redirection mechanism.
+  User MCP configuration loading is an explicitly accepted Chapter 2 security limitation.
 - Secret values in command arguments, logs, test fixtures, or committed configuration.
 - Changes to `design.md`, Chapter 1 behavior, or the target project's checks contract.
 
@@ -146,9 +147,11 @@ approved allow-list is configuration, but it must not contain `--allow-all`, `--
 `--allow-all-paths`, `--allow-all-urls`, `--allow-all`, or `--yolo`. The deny rule for `git push`
 is mandatory and denial precedence is relied upon.
 
-The runner does not use `--trust-folder`, `--add-dir`, user plugins, or user MCP configuration to
-expand the execution scope. Configuration isolation is intentionally limited to the verified flags
-above until a separate technical decision verifies a safe `COPILOT_HOME` strategy.
+The runner does not use `--trust-folder`, `--add-dir`, or user plugins to expand the execution
+scope. The verified flags do not prevent all user MCP configuration from loading; this is an
+explicitly accepted Chapter 2 limitation, not a claim of full configuration isolation. The runner
+must still use the flags above and explicit tool permissions. A safe `COPILOT_HOME` strategy is
+deferred to a later technical decision.
 
 ### Preflight
 
@@ -362,7 +365,8 @@ Chapter 2 is complete only when:
 - Public `factory job run` and its job-state preconditions belong to Chapter 4.
 - Job event schemas for `run_started` and `run_finished` are owned by the orchestrator and must
   extend the Chapter 1 event contract without making the runner a second state writer.
-- Isolated `COPILOT_HOME` remains deferred until the CLI's configuration redirection behavior is
-  verified in a separate technical test.
+- User MCP configuration loading is an accepted Chapter 2 security limitation. Full isolation
+  remains deferred until the CLI's `COPILOT_HOME` behavior is verified in a separate technical
+  test; CH2-01 must not claim that the current flags provide that isolation.
 - Exact per-role allow-list contents and allowed secret environment variable names must be fixed
   in the factory configuration before implementation, without committing secret values.
