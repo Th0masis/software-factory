@@ -1,6 +1,6 @@
 # Chapter 2 — Progress
 
-- **Overall status:** CH2-04 follow-up verified; commit pending.
+- **Overall status:** CH2-04 follow-up complete; CH2-05 regression verified.
 - **Current branch:** `feature/chapter-02`
 - **Contract:** [`chapter-02.md`](./chapter-02.md)
 - **Design deltas:** [`design-deviations.md`](./design-deviations.md)
@@ -9,7 +9,7 @@
 
 - **Completed:** Contract approved; CH2-01 command construction and validation; CH2-02 process execution and artifact persistence; CH2-03 usage parsing and outcome classification; CH2-04 preflight and Windows timeout recovery; CH2-05 runner integration and regression.
 - **Verified:** `config.json` defines the approved tool allow-list, mandatory `shell(git push)` denial, secret environment variable names, and two builder profiles. The installed Copilot CLI supports the required command flags and `--name`.
-- **Remaining:** Commit the verified preflight and Windows timeout recovery follow-up.
+- **Remaining:** None for this follow-up.
 - **Blockers:** The environment cannot create native file symlinks (`WinError 1314`); the symlink guard passed a filesystem-boundary simulation instead.
 
 ## Slice status
@@ -19,7 +19,7 @@
 | CH2-01 — Validating profiles and constructing a safe command | Complete | PASS (9 focused tests; 1 platform skip) | `d6aed01` | Exact command arguments, profile pinning, permission boundaries, path validation, cap threshold, and unique run directories verified. |
 | CH2-02 — Executing a fake Copilot process and preserving artifacts | Complete | PASS (15 focused tests; 1 platform skip) | `e4ebdbf` | Fake-process success, nonzero exit with partial output, launch failure, and missing-artifact failure. |
 | CH2-03 — Parsing usage and classifying outcomes | Complete | PASS (25 focused tests; 1 platform skip) | `b8552c3` | Usage validation, model matching, budget signals, malformed output, fail-closed cases, and timeout precedence. |
-| CH2-04 — Preflight and Windows timeout recovery | Follow-up verified; commit pending | Focused follow-up tests passed; 1 platform skip | `8551d08` | Separate authentication check, enforced preflight, and Windows Job Object containment implemented. |
+| CH2-04 — Preflight and Windows timeout recovery | Complete | Focused follow-up tests passed; 1 platform skip | `8551d08`; follow-up `e3ce8e4` | Separate authentication check, enforced preflight, and Windows Job Object containment implemented. |
 | CH2-05 — Runner integration contract and regression | Follow-up verified | Full suite: 66 tests, 65 passed, 1 platform skip | `d9bc931` | Full suite passed after CH2-04 fixes. |
 
 ## CH2-01 checkpoint
@@ -64,6 +64,7 @@
 - **Interface decision:** User approved returning `ERROR` with `paths={}` when preflight fails, because no run directory exists; recorded as DD-18. The live preflight was verified, but a live agent execution was not.
 - **Final regression:** One full-suite attempt failed in the existing `test_worktree_release_removes_clean_worktree_and_keeps_branch` with `JSONDecodeError` when the worktree attachment returned empty stdout; its underlying failure was not captured. The isolated test then passed, and a repeated `.venv\Scripts\python.exe -m unittest discover -s tests -v` passed: 66 tests, 65 passed, 1 native symlink skip. `.venv\Scripts\python.exe -m compileall -q factory tests` and `git -c core.whitespace=cr-at-eol diff --check` passed.
 - **Follow-up reviewed scope:** `factory/runner.py`, `factory/windows_job.py`, `tests/test_runner.py`, this progress record, and DD-18 in `design-deviations.md`.
+- **Follow-up checkpoint SHA:** `e3ce8e4`.
 - **Live preflight:** `.venv\Scripts\python.exe -c "from factory.runner import preflight; print(preflight())"` returned `PreflightResult(ok=True, model=None, error=None)` after the separate smoke check was added.
 - **Decision:** User approved live model probes for preflight; each distinct configured model is checked with a short non-interactive request. Unit tests mock subprocesses and do not consume credits.
 - **RED:** `.venv\Scripts\python.exe -m unittest discover -s tests -p test_runner.py -k terminates_child_process -v` failed because the child process survived direct-parent termination. `.venv\Scripts\python.exe -m unittest discover -s tests -p test_runner.py -k preflight_returns_authentication_failure -v` failed because `preflight` did not exist.
