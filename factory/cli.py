@@ -5,6 +5,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
+from .gate import evaluate_gate
 from .job import (
     ConfigurationError,
     FactoryError,
@@ -36,6 +37,10 @@ def _parser():
     resume = job_commands.add_parser("resume")
     resume.add_argument("job_id")
     resume.add_argument("--reason", required=True)
+    gate = job_commands.add_parser("gate")
+    gate.add_argument("job_id")
+    gate.add_argument("--base", required=True)
+    gate.add_argument("--mode", choices=("fast", "full"), required=True)
     worktree = job_commands.add_parser("worktree")
     worktree_commands = worktree.add_subparsers(
         dest="worktree_command", required=True
@@ -62,6 +67,21 @@ def main(argv=None):
             result = transition_job(Path.cwd(), args.job_id, args.target, args.reason)
         elif args.job_command == "resume":
             result = resume_job(Path.cwd(), args.job_id, args.reason)
+        elif args.job_command == "gate":
+            result = evaluate_gate(
+                Path.cwd(), args.job_id, args.base, args.mode
+            )
+            print(
+                json.dumps(
+                    {
+                        "verdict": result.verdict,
+                        "report_path": str(result.report_path),
+                        "report": result.report,
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 0 if result.verdict == "PASS" else 1
         elif args.job_command == "worktree":
             if args.worktree_command == "attach":
                 result = attach_worktree(Path.cwd(), args.job_id, args.branch)

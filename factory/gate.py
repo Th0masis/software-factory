@@ -8,8 +8,19 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
+from uuid import uuid4
 
-from .job import ConfigurationError, FactoryConfig, FactoryError
+from .job import (
+    ConfigurationError,
+    FactoryConfig,
+    FactoryError,
+    _job_location,
+    _load_model,
+    _read_event_log,
+    _storage_path,
+    _validate_job_project,
+    _worktree_path,
+)
 from .runner import _close_process_tree, _spawn_process, _terminate_process_tree
 
 
@@ -30,6 +41,13 @@ class ChecksResult:
     stdout: bytes
     stderr: bytes
     error: str | None
+
+
+@dataclass(frozen=True)
+class GateResult:
+    verdict: Literal["PASS", "FAIL"]
+    report_path: Path
+    report: dict[str, object]
 
 
 def _normalize_patterns(patterns, name, *, required):
@@ -306,11 +324,23 @@ def _parse_checks_report(stdout):
     return report, tuple(validated)
 
 
+def _validate_secret_env_vars(config):
+    secret_names = config.runner.secret_env_vars
+    if any(
+        not isinstance(name, str)
+        or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None
+        for name in secret_names
+    ):
+        raise ConfigurationError("runner.secret_env_vars contains an invalid name")
+    return secret_names
+
+
 def run_checks(worktree, base_sha, mode, config):
     if not isinstance(mode, str) or mode not in {"fast", "full"}:
         raise ConfigurationError("mode must be 'fast' or 'full'")
     if not isinstance(config, FactoryConfig):
         raise ConfigurationError("config must be a validated factory config")
+    secret_names = _validate_secret_env_vars(config)
     try:
         worktree = Path(worktree).resolve(strict=True)
     except (OSError, RuntimeError, TypeError, ValueError) as error:
@@ -337,13 +367,6 @@ def run_checks(worktree, base_sha, mode, config):
             error=str(error),
         )
 
-    secret_names = config.runner.secret_env_vars
-    if any(
-        not isinstance(name, str)
-        or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None
-        for name in secret_names
-    ):
-        raise ConfigurationError("runner.secret_env_vars contains an invalid name")
     environment = os.environ.copy()
     for name in secret_names:
         environment.pop(name, None)
@@ -411,3 +434,156 @@ def run_checks(worktree, base_sha, mode, config):
         stderr=stderr_data,
         error=error,
     )
+
+
+def _read_scope_manifest(job_dir, worktree):
+    scope_path = job_dir / "scope.json"
+    try:
+        if not stat.S_ISREG(scope_path.lstat().st_mode):
+            raise ConfigurationError("scope.json must be a regular file")
+        scope_path = scope_path.resolve(strict=True)
+    except OSError as error:
+        raise ConfigurationError(f"cannot read scope.json: {error}") from error
+    if scope_path.parent != job_dir.resolve():
+        raise ConfigurationError("scope.json must be directly under the job directory")
+    if scope_path.is_relative_to(worktree):
+        raise ConfigurationError("scope.json must be outside the target worktree")
+    try:
+        manifest = json.loads(
+            scope_path.read_text(encoding="utf-8"),
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (OSError, ValueError, UnicodeDecodeError) as error:
+        raise ConfigurationError(f"invalid scope.json: {error}") from error
+    if (
+        not isinstance(manifest, dict)
+        or set(manifest) != {"schema_version", "allowed_paths"}
+        or type(manifest["schema_version"]) is not int
+        or manifest["schema_version"] != 1
+        or not isinstance(manifest["allowed_paths"], list)
+    ):
+        raise ConfigurationError("scope.json must contain schema_version 1 and allowed_paths")
+    return _normalize_patterns(
+        manifest["allowed_paths"], "scope manifest", required=True
+    )
+
+
+def _gate_job_context(factory_root, job_id):
+    try:
+        factory_root = Path(factory_root).resolve(strict=True)
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        raise ConfigurationError(f"invalid factory root: {error}") from error
+    if not factory_root.is_dir():
+        raise ConfigurationError(f"factory root is not a directory: {factory_root}")
+    config = _load_model(factory_root / "config.json", FactoryConfig)
+    try:
+        job_id, job_dir = _job_location(factory_root, job_id)
+    except FactoryError as error:
+        if str(error).startswith("job not found:"):
+            raise ConfigurationError(str(error)) from error
+        raise
+    jobs_root = _storage_path(factory_root, config.jobs_dir)
+    if job_dir.is_symlink() or job_dir.resolve().parent != jobs_root:
+        raise ConfigurationError("job directory must be a regular factory-owned directory")
+    job, _ = _read_event_log(job_dir / "events.jsonl", job_id)
+    _validate_job_project(job)
+    if job.worktree_status != "attached" or not job.worktree_path:
+        raise ConfigurationError("job must have an attached worktree")
+    expected_worktree = _worktree_path(factory_root, job)
+    stored_worktree = Path(job.worktree_path)
+    if not stored_worktree.is_absolute() or stored_worktree.is_symlink():
+        raise ConfigurationError("job worktree path must be an absolute non-symlink path")
+    try:
+        worktree = stored_worktree.resolve(strict=True)
+        expected_worktree = expected_worktree.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ConfigurationError(f"invalid job worktree: {error}") from error
+    if worktree != expected_worktree:
+        raise ConfigurationError("job worktree path does not match factory configuration")
+    return config, job_id, job_dir, job, worktree
+
+
+def _create_gate_attempt(job_dir):
+    gate_dir = job_dir / "gate"
+    if gate_dir.is_symlink():
+        raise ConfigurationError("Gate artifact directory must not be a symlink")
+    try:
+        gate_dir.mkdir(exist_ok=True)
+        if not gate_dir.is_dir():
+            raise ConfigurationError("Gate artifact path is not a directory")
+        while True:
+            attempt_dir = gate_dir / str(uuid4())
+            try:
+                attempt_dir.mkdir()
+                return attempt_dir
+            except FileExistsError:
+                continue
+    except OSError as error:
+        raise FactoryError(f"cannot create Gate attempt directory: {error}") from error
+
+
+def _write_gate_artifacts(attempt_dir, report, checks_result):
+    stdout = checks_result.stdout if checks_result is not None else b""
+    stderr = checks_result.stderr if checks_result is not None else b""
+    try:
+        (attempt_dir / "checks.stdout.txt").write_bytes(stdout)
+        (attempt_dir / "checks.stderr.txt").write_bytes(stderr)
+        report_path = attempt_dir / "gate-report.json"
+        report_path.write_text(
+            json.dumps(report, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    except OSError as error:
+        raise FactoryError(f"cannot write Gate artifacts: {error}") from error
+    return report_path
+
+
+def evaluate_gate(factory_root, job_id, base_sha, mode):
+    if not isinstance(mode, str) or mode not in {"fast", "full"}:
+        raise ConfigurationError("mode must be 'fast' or 'full'")
+    config, job_id, job_dir, job, worktree = _gate_job_context(
+        factory_root, job_id
+    )
+    _validate_secret_env_vars(config)
+    scope_manifest = _read_scope_manifest(job_dir, worktree)
+    assessment = assess_changes(worktree, base_sha, scope_manifest)
+
+    attempt_dir = _create_gate_attempt(job_dir)
+    checks_result = None
+    report = {
+        "schema_version": 1,
+        "job_id": job_id,
+        "base_sha": base_sha,
+        "mode": mode,
+        "checks": [],
+        "checks_report": None,
+        "checks_error": None,
+        "checks_skipped": None,
+        "scope": {
+            "changed_paths": list(assessment.changed_paths),
+            "violations": list(assessment.scope_violations),
+        },
+        "protected_paths": {
+            "violations": list(assessment.protected_violations),
+        },
+        "risk": {"status": "DEFERRED"},
+        "verdict": "FAIL",
+    }
+    if assessment.verdict == "FAIL":
+        reasons = []
+        if assessment.scope_violations:
+            reasons.append("scope violations")
+        if assessment.protected_violations:
+            reasons.append("protected-path violations")
+        report["checks_skipped"] = ", ".join(reasons)
+    else:
+        checks_result = run_checks(worktree, base_sha, mode, config)
+        report["checks"] = list(checks_result.checks)
+        report["checks_report"] = checks_result.report
+        report["checks_error"] = checks_result.error
+        if checks_result.verdict == "PASS":
+            report["verdict"] = "PASS"
+
+    report_path = _write_gate_artifacts(attempt_dir, report, checks_result)
+    return GateResult(report["verdict"], report_path, report)
