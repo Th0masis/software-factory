@@ -1,14 +1,18 @@
 import json
+import os
+import shutil
 import subprocess
+import sys
+import tempfile
+import time
+import unittest
 from decimal import Decimal
 from pathlib import Path
-import tempfile
-import unittest
 from unittest.mock import patch
 
 from factory import job as job_service
 from factory.job import ConfigurationError, RunnerProfile
-from factory.runner import build_command, run_agent
+from factory.runner import build_command, preflight, run_agent
 
 
 class RunnerCommandTests(unittest.TestCase):
@@ -83,7 +87,13 @@ class RunnerCommandTests(unittest.TestCase):
         )
 
     def _run_fake_process(
-        self, usage_data, stdout=None, stderr=b"", exit_code=0, create_session=True
+        self,
+        usage_data,
+        stdout=None,
+        stderr=b"",
+        exit_code=0,
+        create_session=True,
+        process=None,
     ):
         output = stdout or b'{"type":"assistant.message","content":"done"}\n'
         error_output = stderr
@@ -99,7 +109,7 @@ class RunnerCommandTests(unittest.TestCase):
                 Path(command[command.index("--share") + 1]).write_text(
                     "# Session output\n", encoding="utf-8"
                 )
-            return _CompletedProcess(returncode=exit_code)
+            return process or _CompletedProcess(returncode=exit_code)
 
         with patch("factory.runner.Path.cwd", return_value=self.factory_root):
             with patch(
@@ -440,13 +450,17 @@ class RunnerCommandTests(unittest.TestCase):
 
         with patch("factory.runner.Path.cwd", return_value=self.factory_root):
             with patch("factory.runner.subprocess.Popen", side_effect=fake_process):
-                result = run_agent(
-                    "builder",
-                    self.profile,
-                    self.task_file,
-                    self.cwd,
-                    "repair-widget",
-                )
+                with patch(
+                    "factory.runner._terminate_process_tree",
+                    side_effect=lambda timed_process: timed_process.kill(),
+                ):
+                    result = run_agent(
+                        "builder",
+                        self.profile,
+                        self.task_file,
+                        self.cwd,
+                        "repair-widget",
+                    )
 
         self.assertEqual(result.outcome, "TIMEOUT")
         self.assertEqual(result.exit_code, -9)
@@ -454,6 +468,211 @@ class RunnerCommandTests(unittest.TestCase):
         self.assertTrue(result.paths["stdout"].is_file())
         self.assertTrue(result.paths["usage"].is_file())
         self.assertTrue(result.paths["session"].is_file())
+
+    @unittest.skipUnless(
+        os.name == "nt" and shutil.which("taskkill"),
+        "Windows taskkill is required for process-tree timeout verification",
+    )
+    def test_run_agent_timeout_terminates_child_process(self):
+        marker = Path(self.temp_dir.name) / "child-survived.txt"
+        child_code = (
+            "import time; from pathlib import Path; "
+            f"time.sleep(1.5); Path({str(marker)!r}).write_text('survived')"
+        )
+        parent_code = (
+            "import subprocess, sys, time; "
+            f"subprocess.Popen([sys.executable, '-c', {child_code!r}]); "
+            "print('started', flush=True); "
+            "time.sleep(60)"
+        )
+        run_dir = Path(self.temp_dir.name) / "run"
+        run_dir.mkdir()
+
+        with patch(
+            "factory.runner._prepare_command",
+            return_value=(
+                [sys.executable, "-c", parent_code],
+                run_dir,
+                0.25,
+                self.cwd,
+            ),
+        ):
+            result = run_agent(
+                "builder",
+                self.profile,
+                self.task_file,
+                self.cwd,
+                "repair-widget",
+            )
+
+        time.sleep(2)
+        self.assertEqual(result.outcome, "TIMEOUT")
+        self.assertFalse(marker.exists(), "child process survived the timeout")
+        self.assertIn("started", result.paths["stdout"].read_text(encoding="utf-8"))
+        self.assertTrue(result.paths["stderr"].is_file())
+
+    def test_preflight_returns_authentication_failure_without_running_agent(self):
+        help_result = subprocess.CompletedProcess(
+            ["copilot", "--help"],
+            0,
+            stdout=(
+                "--model --prompt --no-ask-user --no-auto-update "
+                "--disable-builtin-mcps --no-custom-instructions "
+                "--available-tools --allow-tool"
+            ),
+            stderr="",
+        )
+        probe_result = subprocess.CompletedProcess(
+            ["copilot", "-p"],
+            1,
+            stdout="",
+            stderr="Authentication required",
+        )
+        event_log = self.factory_root / "jobs" / self.job_id / "events.jsonl"
+        events_before = event_log.read_bytes()
+
+        with patch(
+            "factory.runner.subprocess.run",
+            side_effect=[help_result, probe_result],
+        ) as run:
+            result = preflight(factory_root=self.factory_root)
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.model, self.profile.model)
+        self.assertIn("Authentication required", result.error)
+        self.assertEqual(run.call_count, 2)
+        self.assertNotEqual(run.call_args_list[1].kwargs["cwd"], self.cwd)
+        self.assertEqual(event_log.read_bytes(), events_before)
+
+    def test_preflight_checks_each_distinct_model_and_reports_unavailable_model(self):
+        self.config["profiles"]["build-other"] = {
+            "agent": "builder",
+            "model": "gpt-4.1",
+            "effort": "high",
+            "context": "default",
+            "max_ai_credits": 400,
+        }
+        self._write_config()
+        help_result = subprocess.CompletedProcess(
+            ["copilot", "--help"],
+            0,
+            stdout=(
+                "--model --prompt --no-ask-user --no-auto-update "
+                "--disable-builtin-mcps --no-custom-instructions "
+                "--available-tools --allow-tool"
+            ),
+            stderr="",
+        )
+        successful_probe = subprocess.CompletedProcess(
+            ["copilot", "-p"],
+            0,
+            stdout="READY",
+            stderr="",
+        )
+        unavailable_probe = subprocess.CompletedProcess(
+            ["copilot", "-p"],
+            1,
+            stdout="",
+            stderr="Model not available",
+        )
+
+        with patch(
+            "factory.runner.subprocess.run",
+            side_effect=[help_result, successful_probe, unavailable_probe],
+        ) as run:
+            result = preflight(factory_root=self.factory_root)
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.model, "gpt-4.1")
+        self.assertIn("Model not available", result.error)
+        self.assertEqual(run.call_count, 3)
+        probed_models = [
+            call.args[0][call.args[0].index("--model") + 1]
+            for call in run.call_args_list[1:]
+        ]
+        self.assertEqual(probed_models, ["claude-sonnet-5.5", "gpt-4.1"])
+        self.assertTrue(
+            all(call.kwargs["shell"] is False for call in run.call_args_list)
+        )
+
+    def test_preflight_succeeds_after_probing_distinct_configured_models(self):
+        self.config["profiles"]["build-other"] = {
+            "agent": "builder",
+            "model": "gpt-4.1",
+            "effort": "high",
+            "context": "long_context",
+            "max_ai_credits": 400,
+        }
+        self._write_config()
+        help_result = subprocess.CompletedProcess(
+            ["copilot", "--help"],
+            0,
+            stdout=(
+                "--model --prompt --no-ask-user --no-auto-update "
+                "--disable-builtin-mcps --no-custom-instructions "
+                "--available-tools --allow-tool"
+            ),
+            stderr="",
+        )
+        successful_probe = subprocess.CompletedProcess(
+            ["copilot", "-p"],
+            0,
+            stdout="READY",
+            stderr="",
+        )
+
+        with patch(
+            "factory.runner.subprocess.run",
+            side_effect=[help_result, successful_probe, successful_probe],
+        ) as run:
+            result = preflight(factory_root=self.factory_root)
+
+        self.assertTrue(result.ok)
+        self.assertIsNone(result.model)
+        self.assertIsNone(result.error)
+        self.assertEqual(run.call_count, 3)
+        self.assertIn("--available-tools", run.call_args_list[1].args[0])
+        self.assertEqual(
+            run.call_args_list[0].kwargs["cwd"],
+            run.call_args_list[1].kwargs["cwd"],
+        )
+        self.assertEqual(
+            [
+                call.args[0][call.args[0].index("--model") + 1]
+                for call in run.call_args_list[1:]
+            ],
+            ["claude-sonnet-5.5", "gpt-4.1"],
+        )
+        self.assertTrue(
+            Path(run.call_args_list[1].kwargs["cwd"]).name.startswith(
+                "factory-preflight-"
+            )
+        )
+
+    def test_preflight_fails_closed_when_no_models_are_configured(self):
+        self.config["profiles"] = {}
+        self._write_config()
+
+        with patch("factory.runner.subprocess.run") as run:
+            result = preflight(factory_root=self.factory_root)
+
+        self.assertFalse(result.ok)
+        self.assertIsNone(result.model)
+        self.assertIn("no configured runner models", result.error)
+        run.assert_not_called()
+
+    def test_run_agent_reports_process_tree_termination_failure(self):
+        with patch(
+            "factory.runner._terminate_process_tree",
+            side_effect=OSError("taskkill failed"),
+        ):
+            result = self._run_fake_process(
+                {"totalNanoAiu": 10, "currentModel": "claude-sonnet-5.5"},
+                process=_TimedOutProcess(),
+            )
+
+        self.assertEqual(result.outcome, "ERROR")
+        self.assertIn("cannot terminate process tree: taskkill failed", result.error)
 
     def test_run_agent_classifies_explicit_rate_limit_event_as_budget(self):
         result = self._run_fake_process(

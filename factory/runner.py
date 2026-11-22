@@ -1,8 +1,10 @@
 import json
+import os
 import re
 import shutil
 import stat
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from itertools import count
@@ -60,6 +62,13 @@ class Usage:
     @property
     def credits(self):
         return self.total_nano_aiu / Decimal(1_000_000_000)
+
+
+@dataclass(frozen=True)
+class PreflightResult:
+    ok: bool
+    model: str | None
+    error: str | None
 
 
 class UsageError(ValueError):
@@ -244,11 +253,126 @@ def _create_run_dir(artifacts_root):
             continue
 
 
+def _terminate_process_tree(process):
+    if os.name != "nt":
+        process.kill()
+        return
+
+    taskkill = shutil.which("taskkill")
+    if taskkill is None:
+        raise OSError("taskkill.exe was not found")
+    result = subprocess.run(
+        [taskkill, "/F", "/T", "/PID", str(process.pid)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+        check=False,
+    )
+    if result.returncode:
+        detail = result.stderr.decode(errors="replace").strip()
+        raise OSError(detail or f"taskkill exited with status {result.returncode}")
+
+
 def _resolve_executable(executable):
     resolved = shutil.which(executable)
     if resolved is None:
         raise ConfigurationError(f"Copilot executable was not found: {executable}")
     return str(Path(resolved).resolve())
+
+
+def _run_preflight_command(command, timeout_seconds, cwd):
+    try:
+        result = subprocess.run(
+            command,
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_seconds,
+            check=False,
+            shell=False,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        return None, str(error)
+    if result.returncode:
+        diagnostic = "\n".join(
+            output.strip()
+            for output in (result.stderr, result.stdout)
+            if output.strip()
+        )
+        return None, diagnostic or f"Copilot exited with status {result.returncode}"
+    return result.stdout, None
+
+
+def preflight(*, factory_root=None):
+    factory_root = Path(factory_root or Path.cwd()).resolve()
+    config = _load_model(factory_root / "config.json", FactoryConfig)
+    try:
+        executable = _resolve_executable(config.runner.executable)
+    except ConfigurationError as error:
+        return PreflightResult(False, None, str(error))
+
+    timeout_seconds = config.runner.timeout_seconds
+    models = sorted({profile.model for profile in config.profiles.values()})
+    if not models:
+        return PreflightResult(False, None, "no configured runner models")
+    with tempfile.TemporaryDirectory(prefix="factory-preflight-") as probe_cwd:
+        help_output, error = _run_preflight_command(
+            [executable, "--help"], timeout_seconds, probe_cwd
+        )
+        if error:
+            return PreflightResult(
+                False, None, f"Copilot CLI validation failed: {error}"
+            )
+        required_flags = (
+            "--model",
+            "--prompt",
+            "--no-ask-user",
+            "--no-auto-update",
+            "--disable-builtin-mcps",
+            "--no-custom-instructions",
+            "--available-tools",
+            "--allow-tool",
+        )
+        missing_flags = [flag for flag in required_flags if flag not in help_output]
+        if missing_flags:
+            return PreflightResult(
+                False,
+                None,
+                f"Copilot CLI is missing required flags: {', '.join(missing_flags)}",
+            )
+
+        for model in models:
+            _, error = _run_preflight_command(
+                [
+                    executable,
+                    "-p",
+                    "Reply with exactly READY. Do not use tools.",
+                    "--model",
+                    model,
+                    "--no-ask-user",
+                    "--no-auto-update",
+                    "--disable-builtin-mcps",
+                    "--no-custom-instructions",
+                    "--output-format",
+                    "text",
+                    "--available-tools",
+                    "read",
+                    "--allow-tool",
+                    "read",
+                    "--deny-tool",
+                    _REQUIRED_DENY_TOOL,
+                ],
+                timeout_seconds,
+                probe_cwd,
+            )
+            if error:
+                return PreflightResult(False, model, error)
+    return PreflightResult(True, None, None)
 
 
 def _prepare_command(
@@ -349,6 +473,7 @@ def run_agent(role, profile, task_file, cwd, session_name):
     }
 
     launch_error = None
+    termination_error = None
     try:
         with paths["stdout"].open("wb") as stdout, paths["stderr"].open(
             "wb"
@@ -370,7 +495,11 @@ def run_agent(role, profile, task_file, cwd, session_name):
                     timed_out = False
                 except subprocess.TimeoutExpired:
                     timed_out = True
-                    process.kill()
+                    try:
+                        _terminate_process_tree(process)
+                    except (OSError, subprocess.SubprocessError) as error:
+                        termination_error = f"cannot terminate process tree: {error}"
+                        process.kill()
                     exit_code = process.wait()
     except OSError as error:
         return RunResult(
@@ -420,7 +549,10 @@ def run_agent(role, profile, task_file, cwd, session_name):
         and usage.total_nano_aiu
         >= Decimal(profile.max_ai_credits) * Decimal(1_000_000_000)
     )
-    if timed_out:
+    if termination_error:
+        outcome = "ERROR"
+        error = termination_error
+    elif timed_out:
         outcome = "TIMEOUT"
         error = "Copilot process exceeded the configured timeout"
     elif budget_reached:
