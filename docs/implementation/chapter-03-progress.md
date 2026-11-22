@@ -19,7 +19,7 @@
 
 | Slice | Status | Tests | Commit SHA | Notes |
 |---|---|---|---|---|
-| CH3-01 — Reading changes and enforcing scope/protection | Complete | PASS (13 focused tests) | — | Scope, base SHA, protected paths, reserved task input |
+| CH3-01 — Reading changes and enforcing scope/protection | Complete | PASS (13 focused tests) | `42256b8` | Scope, base SHA, protected paths, reserved task input |
 | CH3-02 — Running and validating project checks | Pending | — | — | Depends on CH3-01 |
 | CH3-03 — Producing a Gate report and exposing the CLI | Pending | — | — | Depends on CH3-01 and CH3-02 |
 
