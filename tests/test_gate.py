@@ -105,6 +105,24 @@ class GateChangeAssessmentTests(unittest.TestCase):
 
         self.assertIn("tests/test_app.py", result.protected_violations)
 
+    def test_indented_hash_prefix_is_a_protected_pattern(self):
+        protected_file = self.worktree / ".factory" / "protected.txt"
+        protected_file.write_text("  #generated/**\n", encoding="utf-8")
+        self._git("add", ".factory/protected.txt")
+        self._git("commit", "--quiet", "-m", "protect hash-prefixed paths")
+        self.base_sha = self._git("rev-parse", "HEAD")
+
+        protected_path = self.worktree / "#generated" / "config.py"
+        protected_path.parent.mkdir()
+        protected_path.write_text("secret = True\n", encoding="utf-8")
+
+        result = assess_changes(
+            self.worktree, self.base_sha, ["#generated/**"]
+        )
+
+        self.assertEqual(result.verdict, "FAIL")
+        self.assertIn("#generated/config.py", result.protected_violations)
+
     def test_rename_checks_both_old_and_new_paths(self):
         protected_file = self.worktree / "tests" / "protected.py"
         protected_file.parent.mkdir()

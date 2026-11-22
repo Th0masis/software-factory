@@ -11,7 +11,8 @@
   and review-repair task lifecycle clarified.
 - **Verified:** Documentation whitespace checks passed; `design.md` is unchanged. The topic branch
   is local and based on fetched `origin/main`.
-- **Current slice:** CH3-03 implementation is complete; its targeted tests pass.
+- **Current slice:** Protected-pattern parser review repair is verified; Chapter 3 acceptance
+  remains blocked by the Runner regression tests.
 - **Remaining:** Resolve or establish the baseline for the Runner timeout-test failures before
   declaring Chapter 3 complete.
 - **Blockers:** `test_runner.py` has two failing 0.25-second timeout tests; baseline against
@@ -21,7 +22,7 @@
 
 | Slice | Status | Tests | Commit SHA | Notes |
 |---|---|---|---|---|
-| CH3-01 — Reading changes and enforcing scope/protection | Complete | PASS (13 focused tests) | `42256b8` | Scope, base SHA, protected paths, reserved task input |
+| CH3-01 — Reading changes and enforcing scope/protection | Complete | PASS (14 focused tests) | `42256b8` | Includes protected-pattern parser regression coverage |
 | CH3-02 — Running and validating project checks | Complete | PASS (29 focused Gate tests) | `ba560ae` | Depends on CH3-01 |
 | CH3-03 — Producing a Gate report and exposing the CLI | Targeted tests pass; chapter acceptance blocked | PASS (8 CLI integration tests) | `95b67db` | Existing Runner regression tests fail |
 
@@ -145,6 +146,17 @@
 - **Reviewed scope:** `docs/implementation/chapter-03.md`, this progress file,
   `docs/implementation/design-deviations.md`, and `docs/README.md`.
 - **CH3-03 implementation commit:** `95b67db` (`feat: expose Gate reports and CLI`).
+- **Protected-pattern parser RED:** `uv run --python 3.14 python -m unittest discover -s tests -p test_gate.py -k indented_hash_prefix_is_a_protected_pattern -v`
+  failed as expected: an indented `#generated/**` protection rule was ignored and the changed
+  path incorrectly passed.
+- **Protected-pattern parser GREEN:** The same focused test passed after only treating `#` at
+  column zero as a comment marker; indented lines are now validated as patterns.
+- **Review-repair regression:** `test_gate.py` — all 30 tests passed; `test_gate_cli.py` — all 8
+  tests passed; `uv run --python 3.14 python -m compileall -q factory tests` passed.
+- **Review finding disposition:** No regular-file mode check was added for
+  `.factory/protected.txt`; the approved contract requires it to exist and be tracked but does not
+  require a regular non-symlink file.
+- **Parser repair commit:** Not created yet.
 
 ## Checkpoint policy
 
