@@ -197,7 +197,7 @@ def assess_changes(worktree, base_sha, scope_manifest):
         [
             line.strip()
             for line in protected_text.splitlines()
-            if line.strip() and not line.lstrip().startswith("#")
+            if line.strip() and not line.startswith("#")
         ],
         ".factory/protected.txt",
         required=False,
