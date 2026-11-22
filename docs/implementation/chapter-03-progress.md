@@ -11,22 +11,60 @@
   and review-repair task lifecycle clarified.
 - **Verified:** Documentation whitespace checks passed; `design.md` is unchanged. The topic branch
   is local and based on fetched `origin/main`.
-- **Current slice:** CH3-01 — public test seam confirmed as `factory.gate.assess_changes(...)`.
-- **Remaining:** CH3-01 through CH3-03.
+- **Current slice:** CH3-01 complete; next is CH3-02.
+- **Remaining:** CH3-02 and CH3-03.
 - **Blockers:** None.
 
 ## Slice status
 
 | Slice | Status | Tests | Commit SHA | Notes |
 |---|---|---|---|---|
-| CH3-01 — Reading changes and enforcing scope/protection | In progress | RED pending | — | Seam confirmed; first test not written |
+| CH3-01 — Reading changes and enforcing scope/protection | Complete | PASS (13 focused tests) | — | Scope, base SHA, protected paths, reserved task input |
 | CH3-02 — Running and validating project checks | Pending | — | — | Depends on CH3-01 |
 | CH3-03 — Producing a Gate report and exposing the CLI | Pending | — | — | Depends on CH3-01 and CH3-02 |
 
 ## Baseline and contract checkpoint
 
 - **Contract approval:** User approved `docs/implementation/chapter-03.md` on 2026-11-22.
-- **RED/GREEN:** None yet; no implementation tests have been written.
+- **CH3-01 RED:** `uv run --python 3.14 python -m unittest discover -s tests -p test_gate.py -v`
+  failed with `ModuleNotFoundError: No module named 'factory.gate'`, as expected. The test creates
+  a temporary Git repository, modifies an in-scope tracked file, and adds an out-of-scope untracked
+  file.
+- **CH3-01 GREEN:** The same focused command passed after adding `assess_changes` and Git
+  collection for tracked and untracked paths — 1 test passed.
+- **Protected-path RED:** `uv run --python 3.14 python -m unittest discover -s tests -p test_gate.py -k change_to_protected_path -v`
+  failed because the assessment returned PASS for a protected new test file.
+- **Protected-path GREEN:** The same focused command passed after loading protected patterns from
+  `.factory/protected.txt` at `base_sha` and matching the new file.
+- **Task-input RED:** `uv run --python 3.14 python -m unittest discover -s tests -p test_gate.py -k untracked_task_file -v`
+  failed because the untracked factory task input was incorrectly reported outside scope.
+- **Task-input GREEN:** The same focused command passed after excluding only the exact
+  untracked `.factory/task.md` path.
+- **Staged-task RED:** `uv run --python 3.14 python -m unittest discover -s tests -p test_gate.py -k staged_task_file -v`
+  failed because the task path was not yet included in built-in protected paths.
+- **Staged-task GREEN:** The same focused command passed after adding `.factory/task.md` to the
+  built-in protected patterns.
+- **Built-in-path RED:** `uv run --python 3.14 python -m unittest discover -s tests -p test_gate.py -k project_configuration_and_checks_script -v`
+  failed because `.factory/project.json` was not identified as protected.
+- **Built-in-path GREEN:** The same command passed after adding `.factory/project.json`,
+  `.factory/checks.py`, and `.factory/protected.txt` to the built-in protected paths.
+- **Base-SHA RED:** `uv run --python 3.14 python -m unittest discover -s tests -p test_gate.py -k invalid_base_sha -v`
+  reached Git with an invalid revision and raised `FactoryError` instead of rejecting invalid
+  input as `ConfigurationError`.
+- **Base-SHA GREEN:** The same command passed after validating full commit SHA syntax and
+  resolving it before collecting changes. `-k base_sha_must_be_an_ancestor` also passed after
+  enforcing the ancestor requirement.
+- **Pattern validation RED/GREEN:** `uv run --python 3.14 python -m unittest discover -s tests -p test_gate.py -k unsafe_scope_patterns -v`
+  first failed for repeated/trailing separators and a partial-component `**`; it passed after
+  rejecting malformed path components and requiring `**` to occupy a whole component.
+- **Path behavior verified:** `-k double_star_matches`, `-k single_star_does_not`,
+  `-k protected_patterns_are_read_from_base`, and `-k rename_checks_both` passed. These verify
+  normalized glob semantics, trusted baseline protection rules, and both rename endpoints.
+- **Change-set behavior verified:** `-k change_set_includes` passed with committed, staged,
+  unstaged, and untracked paths present together.
+- **Focused regression:** `uv run --python 3.14 python -m unittest discover -s tests -p test_gate.py -v`
+  — 13 tests passed.
+- **Reviewed scope so far:** `factory/gate.py`, `tests/test_gate.py`, and this progress file.
 - **Documentation checks:** `git -c core.whitespace=cr-at-eol diff --check` passed.
   `design.md` remained unchanged.
 - **Regression baseline:** An attempted full `unittest` run did not complete; it remained active
