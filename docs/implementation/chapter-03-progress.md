@@ -23,7 +23,7 @@
 |---|---|---|---|---|
 | CH3-01 — Reading changes and enforcing scope/protection | Complete | PASS (13 focused tests) | `42256b8` | Scope, base SHA, protected paths, reserved task input |
 | CH3-02 — Running and validating project checks | Complete | PASS (29 focused Gate tests) | `ba560ae` | Depends on CH3-01 |
-| CH3-03 — Producing a Gate report and exposing the CLI | Targeted tests pass; chapter acceptance blocked | PASS (8 CLI integration tests) | — | Existing Runner regression tests fail |
+| CH3-03 — Producing a Gate report and exposing the CLI | Targeted tests pass; chapter acceptance blocked | PASS (8 CLI integration tests) | `95b67db` | Existing Runner regression tests fail |
 
 ## Baseline and contract checkpoint
 
@@ -144,7 +144,7 @@
   Chapter 3 regression acceptance therefore remains unverified.
 - **Reviewed scope:** `docs/implementation/chapter-03.md`, this progress file,
   `docs/implementation/design-deviations.md`, and `docs/README.md`.
-- **CH3-03 commit:** Not created yet.
+- **CH3-03 implementation commit:** `95b67db` (`feat: expose Gate reports and CLI`).
 
 ## Checkpoint policy
 
