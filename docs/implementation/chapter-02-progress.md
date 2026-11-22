@@ -17,7 +17,7 @@
 | Slice | Status | Tests | Commit SHA | Notes |
 |---|---|---|---|---|
 | CH2-01 — Validating profiles and constructing a safe command | Complete | PASS (9 focused tests; 1 platform skip) | `d6aed01` | Exact command arguments, profile pinning, permission boundaries, path validation, cap threshold, and unique run directories verified. |
-| CH2-02 — Executing a fake Copilot process and preserving artifacts | Complete | PASS (15 focused tests; 1 platform skip) | Pending | Fake-process success, nonzero exit with partial output, launch failure, and missing-artifact failure. |
+| CH2-02 — Executing a fake Copilot process and preserving artifacts | Complete | PASS (15 focused tests; 1 platform skip) | `e4ebdbf` | Fake-process success, nonzero exit with partial output, launch failure, and missing-artifact failure. |
 | CH2-03 — Parsing usage and classifying outcomes | Pending | — | — | |
 | CH2-04 — Preflight and Windows timeout recovery | Pending | — | — | |
 | CH2-05 — Runner integration contract and regression | Pending | — | — | |
@@ -40,7 +40,7 @@
 - **Implementation:** Added `RunResult`, `run_agent`, argument-array `Popen(shell=False)`, stdout/stderr files, and explicit process/artifact failure results. Timeout currently terminates only the direct process; CH2-04 owns Windows process-tree termination.
 - **Regression:** Full suite not rerun for CH2-02 yet.
 - **Reviewed scope:** `factory/runner.py`, `tests/test_runner.py`, and this progress record.
-- **Checkpoint SHA:** Pending.
+- **Checkpoint SHA:** `e4ebdbf`.
 
 ## Checkpoint policy
 
