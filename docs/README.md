@@ -6,5 +6,6 @@ Další dokumentaci soustřeď do této složky.
 ## Implementace
 
 - [Implementační kontrakt — Kapitola 1](./implementation/chapter-01.md)
+- [Implementační kontrakt — Kapitola 2](./implementation/chapter-02.md)
 - [Průběh — Kapitola 1](./implementation/chapter-01-progress.md)
 - [Rozhodnutí a odchylky od návrhu](./implementation/design-deviations.md)
