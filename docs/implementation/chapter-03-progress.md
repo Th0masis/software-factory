@@ -1,6 +1,6 @@
 # Chapter 3 — Progress
 
-- **Overall status:** Contract approved; implementation in progress.
+- **Overall status:** Implementation in progress; Chapter 3 regression acceptance is blocked.
 - **Current branch:** `feat/chapter-03-gate`
 - **Contract:** [`chapter-03.md`](./chapter-03.md)
 - **Design deltas:** [`design-deviations.md`](./design-deviations.md)
@@ -11,9 +11,11 @@
   and review-repair task lifecycle clarified.
 - **Verified:** Documentation whitespace checks passed; `design.md` is unchanged. The topic branch
   is local and based on fetched `origin/main`.
-- **Current slice:** CH3-02 complete; next is CH3-03.
-- **Remaining:** CH3-03.
-- **Blockers:** None.
+- **Current slice:** CH3-03 implementation is complete; its targeted tests pass.
+- **Remaining:** Resolve or establish the baseline for the Runner timeout-test failures before
+  declaring Chapter 3 complete.
+- **Blockers:** `test_runner.py` has two failing 0.25-second timeout tests; baseline against
+  pre-CH3-02 Runner code is unverified.
 
 ## Slice status
 
@@ -21,7 +23,7 @@
 |---|---|---|---|---|
 | CH3-01 — Reading changes and enforcing scope/protection | Complete | PASS (13 focused tests) | `42256b8` | Scope, base SHA, protected paths, reserved task input |
 | CH3-02 — Running and validating project checks | Complete | PASS (29 focused Gate tests) | `ba560ae` | Depends on CH3-01 |
-| CH3-03 — Producing a Gate report and exposing the CLI | Pending | — | — | Depends on CH3-01 and CH3-02 |
+| CH3-03 — Producing a Gate report and exposing the CLI | Targeted tests pass; chapter acceptance blocked | PASS (8 CLI integration tests) | — | Existing Runner regression tests fail |
 
 ## Baseline and contract checkpoint
 
@@ -104,16 +106,45 @@
   baseline status remains unverified.
 - **Latest focused check:** `uv run --python 3.14 python -m unittest discover -s tests -p test_gate.py -v`
   — all 29 tests passed after the changed/missing-script FAIL behavior and strict JSON validation.
+- **CH3-03 RED:** `uv run --python 3.14 python -m unittest discover -s tests -p test_gate_cli.py -v`
+  failed because `factory job gate` is not registered. Its integration fixture creates an attached
+  job with a passing target checks script and asserts persisted report output plus unchanged job
+  snapshot/event log.
+- **CH3-03 GREEN:** The same focused integration test passed after adding `evaluate_gate`, unique
+  attempt artifacts, and the `factory job gate JOB_ID --base SHA --mode fast|full` CLI path.
+  The report/log files were persisted and `job.json`/`events.jsonl` remained byte-for-byte unchanged.
+- **CH3-03 failure paths:** Focused CLI tests passed for out-of-scope changes (checks skipped),
+  failing project checks (nonzero exit and persisted report), and distinct immutable attempt
+  directories on rerun.
+- **CH3-03 validation:** Protected-path failures are reported without running checks; invalid
+  scope input returns usage error without creating an attempt. Job snapshot/event bytes remain
+  unchanged on passing and failing attempts.
+- **CH3-03 missing-job RED:** `uv run --python 3.14 python -m unittest discover -s tests -p test_gate_cli.py -k missing_job_is_a_usage_error -v`
+  returned exit `1` for an unknown job. The contract classifies an invalid job as a usage/configuration
+  error (exit `2`).
+- **CH3-03 missing-job GREEN:** The same focused command passed after mapping `job not found` to a
+  configuration error.
+- **CH3-03 scope-file validation:** A focused CLI test passed for rejecting a non-regular
+  `scope.json` before creating an attempt directory.
+- **CH3-03 regression:** `uv run --python 3.14 python -m unittest discover -s tests -p test_gate_cli.py -v`
+  — all 8 CLI integration tests passed.
+- **CH3-03 Gate regression:** `uv run --python 3.14 python -m unittest discover -s tests -p test_gate.py -v`
+  — all 29 unit and process tests passed.
+- **CH3-03 scope reviewed:** `factory/cli.py`, `factory/gate.py`, `tests/test_gate_cli.py`, and this
+  progress record. `design.md` remains unchanged.
 - **Reviewed scope:** `factory/job.py`, `factory/runner.py`, `factory/gate.py`,
   `tests/test_gate.py`, and this progress file.
 - **Documentation checks:** `git -c core.whitespace=cr-at-eol diff --check` passed.
   `design.md` remained unchanged.
-- **Regression baseline:** An attempted full `unittest` run did not complete; it remained active
-  while running `tests/test_runner.py` and was stopped. The cause was not isolated. Treat the full
-  suite baseline as unverified until rerun.
+- **Chapter 1/2 regression gate:** `uv run --python 3.14 python -m unittest discover -s tests -p test_runner.py -v`
+  completed with 2 failures and 1 skip. Both failures are 0.25-second timeout tests that did not
+  capture the child startup marker; each also failed when rerun alone. The prior
+  `test_job_create.py` run passed all 29 tests. The CH3-02 Runner change preserves the original
+  process arguments when no environment is supplied, but a pre-CH3-02 baseline was not run;
+  Chapter 3 regression acceptance therefore remains unverified.
 - **Reviewed scope:** `docs/implementation/chapter-03.md`, this progress file,
   `docs/implementation/design-deviations.md`, and `docs/README.md`.
-- **Commit:** Not created yet.
+- **CH3-03 commit:** Not created yet.
 
 ## Checkpoint policy
 
