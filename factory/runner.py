@@ -267,11 +267,18 @@ def _close_process_tree(process):
         job.close()
 
 
-def _spawn_process(command, *, cwd, stdin, stdout, stderr, shell):
+def _spawn_process(command, *, cwd, stdin, stdout, stderr, shell, env=None):
+    options = {
+        "cwd": cwd,
+        "stdin": stdin,
+        "stdout": stdout,
+        "stderr": stderr,
+        "shell": shell,
+    }
+    if env is not None:
+        options["env"] = env
     if os.name != "nt":
-        return subprocess.Popen(
-            command, cwd=cwd, stdin=stdin, stdout=stdout, stderr=stderr, shell=shell
-        )
+        return subprocess.Popen(command, **options)
 
     from .windows_job import WindowsJob
 
@@ -283,13 +290,9 @@ def _spawn_process(command, *, cwd, stdin, stdout, stderr, shell):
     )
     job = WindowsJob()
     try:
+        process_options = {**options, "stdin": subprocess.PIPE}
         process = subprocess.Popen(
-            [sys.executable, "-c", launcher, *command],
-            cwd=cwd,
-            stdin=subprocess.PIPE,
-            stdout=stdout,
-            stderr=stderr,
-            shell=shell,
+            [sys.executable, "-c", launcher, *command], **process_options
         )
         try:
             job.assign(process.pid)

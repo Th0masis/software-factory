@@ -11,8 +11,8 @@
   and review-repair task lifecycle clarified.
 - **Verified:** Documentation whitespace checks passed; `design.md` is unchanged. The topic branch
   is local and based on fetched `origin/main`.
-- **Current slice:** CH3-01 complete; next is CH3-02.
-- **Remaining:** CH3-02 and CH3-03.
+- **Current slice:** CH3-02 complete; next is CH3-03.
+- **Remaining:** CH3-03.
 - **Blockers:** None.
 
 ## Slice status
@@ -20,7 +20,7 @@
 | Slice | Status | Tests | Commit SHA | Notes |
 |---|---|---|---|---|
 | CH3-01 — Reading changes and enforcing scope/protection | Complete | PASS (13 focused tests) | `42256b8` | Scope, base SHA, protected paths, reserved task input |
-| CH3-02 — Running and validating project checks | Pending | — | — | Depends on CH3-01 |
+| CH3-02 — Running and validating project checks | Complete | PASS (29 focused Gate tests) | — | Depends on CH3-01 |
 | CH3-03 — Producing a Gate report and exposing the CLI | Pending | — | — | Depends on CH3-01 and CH3-02 |
 
 ## Baseline and contract checkpoint
@@ -65,6 +65,47 @@
 - **Focused regression:** `uv run --python 3.14 python -m unittest discover -s tests -p test_gate.py -v`
   — 13 tests passed.
 - **Reviewed scope so far:** `factory/gate.py`, `tests/test_gate.py`, and this progress file.
+- **CH3-01 commit:** `42256b8` (`feat: add Gate change assessment`); progress checkpoint:
+  `a2654a4` (`docs: record CH3-01 checkpoint`).
+- **CH3-02 RED:** `uv run --python 3.14 python -m unittest discover -s tests -p test_gate.py -k valid_passing_checks_report -v`
+  failed because `factory.gate.run_checks` is not implemented. The first check-runner test uses a
+  temporary Git worktree and a valid passing JSON report.
+- **CH3-02 configuration:** Added `gate.timeout_seconds` to factory configuration with a
+  1800-second default and positive-value validation.
+- **CH3-02 GREEN:** The valid-report test passed after adding the checks process seam, script
+  integrity validation, JSON report parsing, and timeout-bounded execution. The shared runner
+  launcher now accepts an explicit environment so Gate can remove configured secret variables.
+- **CH3-02 report validation:** Tests passed for nonzero process exit, reported check failure,
+  contradictory status/exit-code pairs, malformed/missing JSON, duplicate JSON keys and check
+  names, non-standard JSON constants, and non-integer exit codes. The malformed report test first
+  exposed an uncaught `TypeError` for a list-valued status; validation now rejects non-string
+  statuses explicitly.
+- **CH3-02 report preservation:** A RED test showed valid extra JSON fields were discarded from
+  `ChecksResult`. The result now preserves the complete validated report object for the later
+  durable Gate report.
+- **CH3-02 input validation:** Tests passed for repository-root enforcement and rejection of a
+  missing checks script.
+- **CH3-02 execution behavior:** Tests passed for rejecting a changed checks script before launch,
+  invalid modes and secret names, removing a configured secret, forwarding `--full`, handling
+  launch failure, and terminating a child process on timeout while preserving partial output. The
+  Windows timeout-child test passed.
+- **CH3-02 fail result:** Contract review showed that a missing or modified checks script must
+  become a Gate FAIL result (for the future report), not escape as a configuration exception.
+  RED tests reproduced both exceptions; `run_checks` now returns FAIL and does not execute changed
+  script content.
+- **Platform output detail:** Assertions treat captured line endings platform-independently; the
+  initial byte-for-byte LF expectation was incorrect for Windows and was corrected.
+- **Regression runs:** `test_gate.py` — 29 tests passed. `test_job_create.py` — 29 tests passed.
+  The existing Runner successful-contained-process test also passed after the launcher update.
+  `test_runner.py` completed with 2 failures and 1 skipped; both failures were in 0.25-second
+  timeout tests that did not capture their startup marker. Rerunning each test in isolation
+  reproduced the failures. The Runner launcher preserves its previous arguments when no explicit
+  environment is supplied; the failures appear tied to the tests' short startup timeout, but the
+  baseline status remains unverified.
+- **Latest focused check:** `uv run --python 3.14 python -m unittest discover -s tests -p test_gate.py -v`
+  — all 29 tests passed after the changed/missing-script FAIL behavior and strict JSON validation.
+- **Reviewed scope:** `factory/job.py`, `factory/runner.py`, `factory/gate.py`,
+  `tests/test_gate.py`, and this progress file.
 - **Documentation checks:** `git -c core.whitespace=cr-at-eol diff --check` passed.
   `design.md` remained unchanged.
 - **Regression baseline:** An attempted full `unittest` run did not complete; it remained active
