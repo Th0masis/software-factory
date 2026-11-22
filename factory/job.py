@@ -21,11 +21,62 @@ class FactoryError(Exception):
     pass
 
 
+class RunnerConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    executable: str = "copilot"
+    timeout_seconds: int = 1800
+    artifacts_dir: str = "runs"
+    allow_tools: list[str] = []
+    deny_tools: list[str] = []
+    secret_env_vars: list[str] = []
+
+    @field_validator("executable", "artifacts_dir")
+    @classmethod
+    def validate_non_empty(cls, value):
+        if not value.strip():
+            raise ValueError("value must not be empty")
+        return value
+
+    @field_validator("timeout_seconds")
+    @classmethod
+    def validate_timeout(cls, value):
+        if value <= 0:
+            raise ValueError("timeout_seconds must be positive")
+        return value
+
+
+class RunnerProfile(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    agent: str
+    model: str
+    effort: Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+    context: Literal["default", "long_context"]
+    max_ai_credits: int
+
+    @field_validator("agent", "model")
+    @classmethod
+    def validate_profile_name(cls, value):
+        if not value.strip():
+            raise ValueError("profile value must not be empty")
+        return value
+
+    @field_validator("max_ai_credits")
+    @classmethod
+    def validate_credit_cap(cls, value):
+        if value < 0:
+            raise ValueError("max_ai_credits must not be negative")
+        return value
+
+
 class FactoryConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     jobs_dir: str = "jobs"
     worktrees_dir: str = "worktrees"
+    runner: RunnerConfig = RunnerConfig()
+    profiles: dict[str, RunnerProfile] = {}
 
     @field_validator("jobs_dir", "worktrees_dir")
     @classmethod
