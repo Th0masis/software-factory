@@ -4,6 +4,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -254,24 +255,60 @@ def _create_run_dir(artifacts_root):
 
 
 def _terminate_process_tree(process):
-    if os.name != "nt":
+    if os.name == "nt":
+        process._factory_job.terminate()
+    else:
         process.kill()
-        return
 
-    taskkill = shutil.which("taskkill")
-    if taskkill is None:
-        raise OSError("taskkill.exe was not found")
-    result = subprocess.run(
-        [taskkill, "/F", "/T", "/PID", str(process.pid)],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=30,
-        check=False,
+
+def _close_process_tree(process):
+    job = getattr(process, "_factory_job", None)
+    if job is not None:
+        job.close()
+
+
+def _spawn_process(command, *, cwd, stdin, stdout, stderr, shell):
+    if os.name != "nt":
+        return subprocess.Popen(
+            command, cwd=cwd, stdin=stdin, stdout=stdout, stderr=stderr, shell=shell
+        )
+
+    from .windows_job import WindowsJob
+
+    launcher = (
+        "import subprocess, sys; "
+        "token = sys.stdin.buffer.read(1); "
+        "sys.exit(subprocess.Popen(sys.argv[1:], stdin=subprocess.DEVNULL).wait() "
+        "if token == b'1' else 125)"
     )
-    if result.returncode:
-        detail = result.stderr.decode(errors="replace").strip()
-        raise OSError(detail or f"taskkill exited with status {result.returncode}")
+    job = WindowsJob()
+    try:
+        process = subprocess.Popen(
+            [sys.executable, "-c", launcher, *command],
+            cwd=cwd,
+            stdin=subprocess.PIPE,
+            stdout=stdout,
+            stderr=stderr,
+            shell=shell,
+        )
+        try:
+            job.assign(process.pid)
+            process.stdin.write(b"1")
+            process.stdin.close()
+        except OSError:
+            process.stdin.close()
+            job.close()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            raise
+    except OSError:
+        job.close()
+        raise
+    process._factory_job = job
+    return process
 
 
 def _resolve_executable(executable):
@@ -346,29 +383,30 @@ def preflight(*, factory_root=None):
                 f"Copilot CLI is missing required flags: {', '.join(missing_flags)}",
             )
 
+        probe = [
+            executable,
+            "-p",
+            "Reply with exactly READY. Do not use tools.",
+            "--no-ask-user",
+            "--no-auto-update",
+            "--disable-builtin-mcps",
+            "--no-custom-instructions",
+            "--output-format",
+            "text",
+            "--available-tools",
+            "read",
+            "--allow-tool",
+            "read",
+            "--deny-tool",
+            _REQUIRED_DENY_TOOL,
+        ]
+        _, error = _run_preflight_command(probe, timeout_seconds, probe_cwd)
+        if error:
+            return PreflightResult(False, None, f"authentication smoke check: {error}")
+
         for model in models:
             _, error = _run_preflight_command(
-                [
-                    executable,
-                    "-p",
-                    "Reply with exactly READY. Do not use tools.",
-                    "--model",
-                    model,
-                    "--no-ask-user",
-                    "--no-auto-update",
-                    "--disable-builtin-mcps",
-                    "--no-custom-instructions",
-                    "--output-format",
-                    "text",
-                    "--available-tools",
-                    "read",
-                    "--allow-tool",
-                    "read",
-                    "--deny-tool",
-                    _REQUIRED_DENY_TOOL,
-                ],
-                timeout_seconds,
-                probe_cwd,
+                [*probe, "--model", model], timeout_seconds, probe_cwd
             )
             if error:
                 return PreflightResult(False, model, error)
@@ -461,6 +499,17 @@ def build_command(
 
 
 def run_agent(role, profile, task_file, cwd, session_name):
+    preflight_result = preflight()
+    if not preflight_result.ok:
+        model = f" for model {preflight_result.model!r}" if preflight_result.model else ""
+        return RunResult(
+            outcome="ERROR",
+            exit_code=None,
+            usage=None,
+            session_id=None,
+            paths={},
+            error=f"preflight failed{model}: {preflight_result.error}",
+        )
     command, run_dir, timeout_seconds, cwd = _prepare_command(
         role, profile, task_file, cwd, session_name
     )
@@ -479,7 +528,7 @@ def run_agent(role, profile, task_file, cwd, session_name):
             "wb"
         ) as stderr:
             try:
-                process = subprocess.Popen(
+                process = _spawn_process(
                     command,
                     cwd=cwd,
                     stdin=subprocess.DEVNULL,
@@ -499,8 +548,11 @@ def run_agent(role, profile, task_file, cwd, session_name):
                         _terminate_process_tree(process)
                     except (OSError, subprocess.SubprocessError) as error:
                         termination_error = f"cannot terminate process tree: {error}"
+                        _close_process_tree(process)
                         process.kill()
                     exit_code = process.wait()
+                finally:
+                    _close_process_tree(process)
     except OSError as error:
         return RunResult(
             outcome="ERROR",

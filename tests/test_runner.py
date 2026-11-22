@@ -64,6 +64,12 @@ class RunnerCommandTests(unittest.TestCase):
         self.profile = RunnerProfile.model_validate(
             self.config["profiles"]["build-standard"]
         )
+        preflight_patch = patch(
+            "factory.runner.preflight",
+            return_value=runner_module.PreflightResult(True, None, None),
+        )
+        preflight_patch.start()
+        self.addCleanup(preflight_patch.stop)
 
     def _write_config(self):
         (self.factory_root / "config.json").write_text(
@@ -114,7 +120,7 @@ class RunnerCommandTests(unittest.TestCase):
 
         with patch("factory.runner.Path.cwd", return_value=self.factory_root):
             with patch(
-                "factory.runner.subprocess.Popen", side_effect=fake_process
+                "factory.runner._spawn_process", side_effect=fake_process
             ):
                 return run_agent(
                     "builder",
@@ -282,7 +288,7 @@ class RunnerCommandTests(unittest.TestCase):
             return _CompletedProcess()
 
         with patch("factory.runner.Path.cwd", return_value=self.factory_root):
-            with patch("factory.runner.subprocess.Popen", side_effect=fake_process):
+            with patch("factory.runner._spawn_process", side_effect=fake_process):
                 result = run_agent(
                     "builder",
                     self.profile,
@@ -312,7 +318,7 @@ class RunnerCommandTests(unittest.TestCase):
             return _CompletedProcess(returncode=7)
 
         with patch("factory.runner.Path.cwd", return_value=self.factory_root):
-            with patch("factory.runner.subprocess.Popen", side_effect=fake_process):
+            with patch("factory.runner._spawn_process", side_effect=fake_process):
                 result = run_agent(
                     "builder",
                     self.profile,
@@ -334,7 +340,7 @@ class RunnerCommandTests(unittest.TestCase):
     def test_run_agent_reports_process_launch_failure(self):
         with patch("factory.runner.Path.cwd", return_value=self.factory_root):
             with patch(
-                "factory.runner.subprocess.Popen",
+                "factory.runner._spawn_process",
                 side_effect=OSError("executable unavailable"),
             ):
                 result = run_agent(
@@ -357,7 +363,7 @@ class RunnerCommandTests(unittest.TestCase):
             return _CompletedProcess()
 
         with patch("factory.runner.Path.cwd", return_value=self.factory_root):
-            with patch("factory.runner.subprocess.Popen", side_effect=fake_process):
+            with patch("factory.runner._spawn_process", side_effect=fake_process):
                 result = run_agent(
                     "builder",
                     self.profile,
@@ -389,7 +395,7 @@ class RunnerCommandTests(unittest.TestCase):
             return _CompletedProcess()
 
         with patch("factory.runner.Path.cwd", return_value=self.factory_root):
-            with patch("factory.runner.subprocess.Popen", side_effect=fake_process):
+            with patch("factory.runner._spawn_process", side_effect=fake_process):
                 result = run_agent(
                     "builder",
                     self.profile,
@@ -418,7 +424,7 @@ class RunnerCommandTests(unittest.TestCase):
             return _CompletedProcess()
 
         with patch("factory.runner.Path.cwd", return_value=self.factory_root):
-            with patch("factory.runner.subprocess.Popen", side_effect=fake_process):
+            with patch("factory.runner._spawn_process", side_effect=fake_process):
                 result = run_agent(
                     "builder",
                     self.profile,
@@ -450,7 +456,7 @@ class RunnerCommandTests(unittest.TestCase):
             return process
 
         with patch("factory.runner.Path.cwd", return_value=self.factory_root):
-            with patch("factory.runner.subprocess.Popen", side_effect=fake_process):
+            with patch("factory.runner._spawn_process", side_effect=fake_process):
                 with patch(
                     "factory.runner._terminate_process_tree",
                     side_effect=lambda timed_process: timed_process.kill(),
@@ -470,10 +476,7 @@ class RunnerCommandTests(unittest.TestCase):
         self.assertTrue(result.paths["usage"].is_file())
         self.assertTrue(result.paths["session"].is_file())
 
-    @unittest.skipUnless(
-        os.name == "nt" and shutil.which("taskkill"),
-        "Windows taskkill is required for process-tree timeout verification",
-    )
+    @unittest.skipUnless(os.name == "nt", "Windows process-tree verification")
     def test_run_agent_timeout_terminates_child_process(self):
         marker = Path(self.temp_dir.name) / "child-survived.txt"
         child_code = (
@@ -489,28 +492,107 @@ class RunnerCommandTests(unittest.TestCase):
         run_dir = Path(self.temp_dir.name) / "run"
         run_dir.mkdir()
 
+        original_which = shutil.which
         with patch(
-            "factory.runner._prepare_command",
-            return_value=(
-                [sys.executable, "-c", parent_code],
-                run_dir,
-                0.25,
-                self.cwd,
-            ),
+            "factory.runner.shutil.which",
+            side_effect=lambda name: None if name == "taskkill" else original_which(name),
         ):
-            result = run_agent(
-                "builder",
-                self.profile,
-                self.task_file,
-                self.cwd,
-                "repair-widget",
-            )
+            with patch(
+                "factory.runner._prepare_command",
+                return_value=(
+                    [sys.executable, "-c", parent_code],
+                    run_dir,
+                    0.25,
+                    self.cwd,
+                ),
+            ):
+                result = run_agent(
+                    "builder",
+                    self.profile,
+                    self.task_file,
+                    self.cwd,
+                    "repair-widget",
+                )
 
         time.sleep(2)
         self.assertEqual(result.outcome, "TIMEOUT")
         self.assertFalse(marker.exists(), "child process survived the timeout")
         self.assertIn("started", result.paths["stdout"].read_text(encoding="utf-8"))
         self.assertTrue(result.paths["stderr"].is_file())
+
+    @unittest.skipUnless(os.name == "nt", "Windows process-tree verification")
+    def test_run_agent_closes_job_if_tree_termination_fails(self):
+        marker = Path(self.temp_dir.name) / "child-survived.txt"
+        child_code = (
+            "import time; from pathlib import Path; "
+            f"time.sleep(1.5); Path({str(marker)!r}).write_text('survived')"
+        )
+        parent_code = (
+            "import subprocess, sys, time; "
+            f"subprocess.Popen([sys.executable, '-c', {child_code!r}]); "
+            "print('started', flush=True); time.sleep(60)"
+        )
+        run_dir = Path(self.temp_dir.name) / "run"
+        run_dir.mkdir()
+        with patch(
+            "factory.runner._prepare_command",
+            return_value=([sys.executable, "-c", parent_code], run_dir, 0.25, self.cwd),
+        ):
+            with patch(
+                "factory.runner._terminate_process_tree",
+                side_effect=OSError("termination failed"),
+            ):
+                result = run_agent(
+                    "builder", self.profile, self.task_file, self.cwd, "test"
+                )
+        time.sleep(2)
+        self.assertEqual(result.outcome, "ERROR")
+        self.assertIn("termination failed", result.error)
+        self.assertIn("started", result.paths["stdout"].read_text(encoding="utf-8"))
+        self.assertFalse(marker.exists(), "child process survived the timeout")
+
+    @unittest.skipUnless(os.name == "nt", "Windows process-tree verification")
+    def test_run_agent_does_not_start_if_job_assignment_fails(self):
+        marker = Path(self.temp_dir.name) / "agent-started.txt"
+        agent_code = f"from pathlib import Path; Path({str(marker)!r}).touch()"
+        run_dir = Path(self.temp_dir.name) / "run"
+        run_dir.mkdir()
+        with patch(
+            "factory.runner._prepare_command",
+            return_value=([sys.executable, "-c", agent_code], run_dir, 5, self.cwd),
+        ):
+            with patch("factory.windows_job.WindowsJob.assign", side_effect=OSError("denied")):
+                result = run_agent(
+                    "builder", self.profile, self.task_file, self.cwd, "test"
+                )
+        self.assertEqual(result.outcome, "ERROR")
+        self.assertIn("denied", result.error)
+        self.assertFalse(marker.exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows process-tree verification")
+    def test_run_agent_preserves_successful_contained_process_result(self):
+        run_dir = Path(self.temp_dir.name) / "run"
+        run_dir.mkdir()
+        agent_code = (
+            "import json, sys; from pathlib import Path; "
+            "Path(sys.argv[1]).write_text(json.dumps("
+            "{'totalNanoAiu': 10, 'currentModel': 'claude-sonnet-5.5'})); "
+            "Path(sys.argv[2]).write_text('# Session'); "
+            "print(json.dumps({'type': 'assistant.message', 'content': 'done'}))"
+        )
+        command = [
+            sys.executable, "-c", agent_code,
+            str(run_dir / "usage.json"), str(run_dir / "session.md"),
+        ]
+        with patch(
+            "factory.runner._prepare_command", return_value=(command, run_dir, 5, self.cwd)
+        ):
+            result = run_agent("builder", self.profile, self.task_file, self.cwd, "test")
+
+        self.assertEqual(result.outcome, "OK")
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("done", result.paths["stdout"].read_text(encoding="utf-8"))
+        self.assertEqual(result.paths["session"].read_text(encoding="utf-8"), "# Session")
 
     def test_preflight_returns_authentication_failure_without_running_agent(self):
         help_result = subprocess.CompletedProcess(
@@ -539,11 +621,36 @@ class RunnerCommandTests(unittest.TestCase):
             result = preflight(factory_root=self.factory_root)
 
         self.assertFalse(result.ok)
-        self.assertEqual(result.model, self.profile.model)
+        self.assertIsNone(result.model)
         self.assertIn("Authentication required", result.error)
         self.assertEqual(run.call_count, 2)
         self.assertNotEqual(run.call_args_list[1].kwargs["cwd"], self.cwd)
         self.assertEqual(event_log.read_bytes(), events_before)
+
+    def test_preflight_authentication_check_precedes_model_checks(self):
+        help_result = subprocess.CompletedProcess(
+            ["copilot", "--help"],
+            0,
+            stdout=(
+                "--model --prompt --no-ask-user --no-auto-update "
+                "--disable-builtin-mcps --no-custom-instructions "
+                "--available-tools --allow-tool"
+            ),
+            stderr="",
+        )
+        auth_failure = subprocess.CompletedProcess(
+            ["copilot", "-p"], 1, stdout="", stderr="Authentication required"
+        )
+        with patch(
+            "factory.runner.subprocess.run", side_effect=[help_result, auth_failure]
+        ) as run:
+            result = preflight(factory_root=self.factory_root)
+
+        self.assertFalse(result.ok)
+        self.assertIsNone(result.model)
+        self.assertIn("Authentication required", result.error)
+        self.assertEqual(run.call_count, 2)
+        self.assertNotIn("--model", run.call_args_list[1].args[0])
 
     def test_preflight_checks_each_distinct_model_and_reports_unavailable_model(self):
         self.config["profiles"]["build-other"] = {
@@ -579,17 +686,19 @@ class RunnerCommandTests(unittest.TestCase):
 
         with patch(
             "factory.runner.subprocess.run",
-            side_effect=[help_result, successful_probe, unavailable_probe],
+            side_effect=[
+                help_result, successful_probe, successful_probe, unavailable_probe
+            ],
         ) as run:
             result = preflight(factory_root=self.factory_root)
 
         self.assertFalse(result.ok)
         self.assertEqual(result.model, "gpt-4.1")
         self.assertIn("Model not available", result.error)
-        self.assertEqual(run.call_count, 3)
+        self.assertEqual(run.call_count, 4)
         probed_models = [
             call.args[0][call.args[0].index("--model") + 1]
-            for call in run.call_args_list[1:]
+            for call in run.call_args_list[2:]
         ]
         self.assertEqual(probed_models, ["claude-sonnet-5.5", "gpt-4.1"])
         self.assertTrue(
@@ -624,14 +733,16 @@ class RunnerCommandTests(unittest.TestCase):
 
         with patch(
             "factory.runner.subprocess.run",
-            side_effect=[help_result, successful_probe, successful_probe],
+            side_effect=[
+                help_result, successful_probe, successful_probe, successful_probe
+            ],
         ) as run:
             result = preflight(factory_root=self.factory_root)
 
         self.assertTrue(result.ok)
         self.assertIsNone(result.model)
         self.assertIsNone(result.error)
-        self.assertEqual(run.call_count, 3)
+        self.assertEqual(run.call_count, 4)
         self.assertIn("--available-tools", run.call_args_list[1].args[0])
         self.assertEqual(
             run.call_args_list[0].kwargs["cwd"],
@@ -640,7 +751,7 @@ class RunnerCommandTests(unittest.TestCase):
         self.assertEqual(
             [
                 call.args[0][call.args[0].index("--model") + 1]
-                for call in run.call_args_list[1:]
+                for call in run.call_args_list[2:]
             ],
             ["claude-sonnet-5.5", "gpt-4.1"],
         )
@@ -661,6 +772,22 @@ class RunnerCommandTests(unittest.TestCase):
         self.assertIsNone(result.model)
         self.assertIn("no configured runner models", result.error)
         run.assert_not_called()
+
+    def test_run_agent_does_not_start_or_allocate_run_after_preflight_failure(self):
+        failure = runner_module.PreflightResult(False, None, "authentication failed")
+        runs_dir = self.factory_root / "jobs" / self.job_id / "runs"
+        with patch("factory.runner.Path.cwd", return_value=self.factory_root):
+            with patch("factory.runner.preflight", return_value=failure):
+                with patch("factory.runner._spawn_process") as process:
+                    result = run_agent(
+                        "builder", self.profile, self.task_file, self.cwd, "test"
+                    )
+
+        self.assertEqual(result.outcome, "ERROR")
+        self.assertIn("authentication failed", result.error)
+        self.assertEqual(result.paths, {})
+        self.assertFalse(runs_dir.exists())
+        process.assert_not_called()
 
     def test_run_agent_leaves_job_journal_unchanged(self):
         job_dir = self.factory_root / "jobs" / self.job_id
@@ -684,7 +811,7 @@ class RunnerCommandTests(unittest.TestCase):
             return _CompletedProcess()
 
         with patch("factory.runner.Path.cwd", return_value=self.factory_root):
-            with patch("factory.runner.subprocess.Popen", side_effect=fake_process):
+            with patch("factory.runner._spawn_process", side_effect=fake_process):
                 result = runner_module.run_agent(
                     "builder",
                     self.profile,
