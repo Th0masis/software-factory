@@ -16,7 +16,7 @@
 
 | Slice | Status | Tests | Commit SHA | Notes |
 |---|---|---|---|---|
-| CH2-01 — Validating profiles and constructing a safe command | Complete | PASS (9 focused tests; 1 platform skip) | Pending | Exact command arguments, profile pinning, permission boundaries, path validation, cap threshold, and unique run directories verified. |
+| CH2-01 — Validating profiles and constructing a safe command | Complete | PASS (9 focused tests; 1 platform skip) | `d6aed01` | Exact command arguments, profile pinning, permission boundaries, path validation, cap threshold, and unique run directories verified. |
 | CH2-02 — Executing a fake Copilot process and preserving artifacts | Pending | — | — | |
 | CH2-03 — Parsing usage and classifying outcomes | Pending | — | — | |
 | CH2-04 — Preflight and Windows timeout recovery | Pending | — | — | |
@@ -30,7 +30,7 @@
 - **Additional checks:** `.venv\Scripts\python.exe -m compileall -q factory tests` and `git -c core.whitespace=cr-at-eol diff --check` — passed.
 - **Implementation:** Added argument-array command construction with resolved executable, pinned configured profile, approved flags, required `git push` denial, cap omission below 30, task/worktree validation, and atomic unique per-job run-directory allocation. Job identity is checked from the authoritative journal without rebuilding or mutating `job.json`.
 - **Reviewed scope:** `factory/runner.py`, `tests/test_runner.py`, and this progress record.
-- **Checkpoint SHA:** Pending commit.
+- **Checkpoint SHA:** `d6aed01`.
 
 ## Checkpoint policy
 
