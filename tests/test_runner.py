@@ -1,4 +1,6 @@
 import json
+import subprocess
+from decimal import Decimal
 from pathlib import Path
 import tempfile
 import unittest
@@ -79,6 +81,37 @@ class RunnerCommandTests(unittest.TestCase):
             session_name,
             factory_root=self.factory_root,
         )
+
+    def _run_fake_process(
+        self, usage_data, stdout=None, stderr=b"", exit_code=0, create_session=True
+    ):
+        output = stdout or b'{"type":"assistant.message","content":"done"}\n'
+        error_output = stderr
+
+        def fake_process(command, cwd, stdin, stdout, stderr, shell):
+            stdout.write(output)
+            stderr.write(error_output)
+            if usage_data is not None:
+                Path(command[command.index("--usage-output-file") + 1]).write_text(
+                    json.dumps(usage_data), encoding="utf-8"
+                )
+            if create_session:
+                Path(command[command.index("--share") + 1]).write_text(
+                    "# Session output\n", encoding="utf-8"
+                )
+            return _CompletedProcess(returncode=exit_code)
+
+        with patch("factory.runner.Path.cwd", return_value=self.factory_root):
+            with patch(
+                "factory.runner.subprocess.Popen", side_effect=fake_process
+            ):
+                return run_agent(
+                    "builder",
+                    self.profile,
+                    self.task_file,
+                    self.cwd,
+                    "repair-widget",
+                )
 
     def test_build_command_pins_profile_permissions_and_artifact_paths(self):
         command = self._build_command()
@@ -249,7 +282,7 @@ class RunnerCommandTests(unittest.TestCase):
 
         self.assertEqual(result.outcome, "OK")
         self.assertEqual(result.exit_code, 0)
-        self.assertEqual(result.usage["totalNanoAiu"], 10)
+        self.assertEqual(result.usage.total_nano_aiu, Decimal("10"))
         self.assertEqual(result.session_id, "session-123")
         self.assertEqual(
             result.paths["stdout"].read_text(encoding="utf-8"),
@@ -326,6 +359,171 @@ class RunnerCommandTests(unittest.TestCase):
         self.assertIn("usage.json was not created", result.error)
         self.assertIn("session.md was not created", result.error)
 
+    def test_run_agent_parses_usage_and_preserves_unknown_fields(self):
+        usage_data = {
+            "totalNanoAiu": 1_500_000_000,
+            "currentModel": "claude-sonnet-5.5",
+            "sessionId": "session-123",
+            "futureField": {"preserved": True},
+        }
+
+        def fake_process(command, cwd, stdin, stdout, stderr, shell):
+            stdout.write(b'{"type":"assistant.message","content":"done"}\n')
+            Path(command[command.index("--usage-output-file") + 1]).write_text(
+                json.dumps(usage_data), encoding="utf-8"
+            )
+            Path(command[command.index("--share") + 1]).write_text(
+                "# Session output\n", encoding="utf-8"
+            )
+            return _CompletedProcess()
+
+        with patch("factory.runner.Path.cwd", return_value=self.factory_root):
+            with patch("factory.runner.subprocess.Popen", side_effect=fake_process):
+                result = run_agent(
+                    "builder",
+                    self.profile,
+                    self.task_file,
+                    self.cwd,
+                    "repair-widget",
+                )
+
+        self.assertEqual(result.usage.total_nano_aiu, Decimal("1500000000"))
+        self.assertEqual(result.usage.credits, Decimal("1.5"))
+        self.assertEqual(result.usage.raw["futureField"], {"preserved": True})
+
+    def test_run_agent_classifies_usage_at_cap_as_budget(self):
+        usage_data = {
+            "totalNanoAiu": 400_000_000_000,
+            "currentModel": "claude-sonnet-5.5",
+        }
+
+        def fake_process(command, cwd, stdin, stdout, stderr, shell):
+            Path(command[command.index("--usage-output-file") + 1]).write_text(
+                json.dumps(usage_data), encoding="utf-8"
+            )
+            Path(command[command.index("--share") + 1]).write_text(
+                "# Session output\n", encoding="utf-8"
+            )
+            return _CompletedProcess()
+
+        with patch("factory.runner.Path.cwd", return_value=self.factory_root):
+            with patch("factory.runner.subprocess.Popen", side_effect=fake_process):
+                result = run_agent(
+                    "builder",
+                    self.profile,
+                    self.task_file,
+                    self.cwd,
+                    "repair-widget",
+                )
+
+        self.assertEqual(result.outcome, "BUDGET")
+        self.assertEqual(result.exit_code, 0)
+
+    def test_run_agent_gives_timeout_priority_over_budget(self):
+        process = _TimedOutProcess()
+
+        def fake_process(command, cwd, stdin, stdout, stderr, shell):
+            stdout.write(b'{"type":"assistant.message","content":"partial"}\n')
+            Path(command[command.index("--usage-output-file") + 1]).write_text(
+                json.dumps(
+                    {
+                        "totalNanoAiu": 400_000_000_000,
+                        "currentModel": "claude-sonnet-5.5",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            Path(command[command.index("--share") + 1]).write_text(
+                "# Partial session\n", encoding="utf-8"
+            )
+            return process
+
+        with patch("factory.runner.Path.cwd", return_value=self.factory_root):
+            with patch("factory.runner.subprocess.Popen", side_effect=fake_process):
+                result = run_agent(
+                    "builder",
+                    self.profile,
+                    self.task_file,
+                    self.cwd,
+                    "repair-widget",
+                )
+
+        self.assertEqual(result.outcome, "TIMEOUT")
+        self.assertEqual(result.exit_code, -9)
+        self.assertTrue(process.killed)
+        self.assertTrue(result.paths["stdout"].is_file())
+        self.assertTrue(result.paths["usage"].is_file())
+        self.assertTrue(result.paths["session"].is_file())
+
+    def test_run_agent_classifies_explicit_rate_limit_event_as_budget(self):
+        result = self._run_fake_process(
+            None,
+            stdout=(
+                b'{"type":"session.error","data":{"errorType":"rate_limit",'
+                b'"message":"Too many requests"}}\n'
+            ),
+            exit_code=1,
+        )
+
+        self.assertEqual(result.outcome, "BUDGET")
+
+    def test_run_agent_rejects_usage_model_mismatch(self):
+        result = self._run_fake_process(
+            {
+                "totalNanoAiu": 10,
+                "currentModel": "claude-haiku-5.5",
+            }
+        )
+
+        self.assertEqual(result.outcome, "ERROR")
+        self.assertIn("does not match", result.error)
+
+    def test_run_agent_uses_single_model_metrics_key_when_current_model_is_missing(
+        self,
+    ):
+        result = self._run_fake_process(
+            {
+                "totalNanoAiu": 10,
+                "modelMetrics": {"claude-sonnet-5.5": {"totalNanoAiu": 10}},
+            }
+        )
+
+        self.assertEqual(result.outcome, "OK")
+        self.assertEqual(result.usage.effective_model, "claude-sonnet-5.5")
+
+    def test_run_agent_fails_closed_for_invalid_usage(self):
+        invalid_usage = (
+            {},
+            {"totalNanoAiu": True, "currentModel": "claude-sonnet-5.5"},
+            {"totalNanoAiu": -1, "currentModel": "claude-sonnet-5.5"},
+            {"totalNanoAiu": "10", "currentModel": "claude-sonnet-5.5"},
+            {"totalNanoAiu": 10, "modelMetrics": {"model-a": {}, "model-b": {}}},
+        )
+        for usage_data in invalid_usage:
+            with self.subTest(usage_data=usage_data):
+                result = self._run_fake_process(usage_data)
+                self.assertEqual(result.outcome, "ERROR")
+                self.assertIsNone(result.usage)
+
+    def test_run_agent_does_not_infer_budget_from_nonzero_exit(self):
+        result = self._run_fake_process(
+            {"totalNanoAiu": 10, "currentModel": "claude-sonnet-5.5"},
+            stderr=b"Authentication failed\n",
+            exit_code=1,
+        )
+
+        self.assertEqual(result.outcome, "ERROR")
+        self.assertIn("status 1", result.error)
+
+    def test_run_agent_rejects_malformed_jsonl_on_successful_exit(self):
+        result = self._run_fake_process(
+            {"totalNanoAiu": 10, "currentModel": "claude-sonnet-5.5"},
+            stdout=b"not-json\n",
+        )
+
+        self.assertEqual(result.outcome, "ERROR")
+        self.assertIn("invalid stdout.jsonl", result.error)
+
 
 class _CompletedProcess:
     def __init__(self, returncode=0):
@@ -333,3 +531,18 @@ class _CompletedProcess:
 
     def wait(self, timeout=None):
         return self.returncode
+
+
+class _TimedOutProcess:
+    def __init__(self):
+        self.wait_calls = 0
+        self.killed = False
+
+    def wait(self, timeout=None):
+        self.wait_calls += 1
+        if self.wait_calls == 1:
+            raise subprocess.TimeoutExpired("copilot", timeout)
+        return -9
+
+    def kill(self):
+        self.killed = True

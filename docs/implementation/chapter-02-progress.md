@@ -1,6 +1,6 @@
 # Chapter 2 — Progress
 
-- **Overall status:** CH2-01 and CH2-02 complete; CH2-03 through CH2-05 pending.
+- **Overall status:** CH2-01 and CH2-02 complete; CH2-03 in progress; CH2-04 and CH2-05 pending.
 - **Current branch:** `feature/chapter-02`
 - **Contract:** [`chapter-02.md`](./chapter-02.md)
 - **Design deltas:** [`design-deviations.md`](./design-deviations.md)
@@ -9,7 +9,7 @@
 
 - **Completed:** Contract approved; CH2-01 command construction and validation; CH2-02 process execution and artifact persistence.
 - **Verified:** `config.json` defines the approved tool allow-list, mandatory `shell(git push)` denial, secret environment variable names, and two builder profiles. The installed Copilot CLI supports the required command flags and `--name`.
-- **Remaining:** CH2-03 through CH2-05.
+- **Remaining:** Complete CH2-03, then CH2-04 and CH2-05.
 - **Blockers:** The environment cannot create native file symlinks (`WinError 1314`); the symlink guard passed a filesystem-boundary simulation instead.
 
 ## Slice status
@@ -18,7 +18,7 @@
 |---|---|---|---|---|
 | CH2-01 — Validating profiles and constructing a safe command | Complete | PASS (9 focused tests; 1 platform skip) | `d6aed01` | Exact command arguments, profile pinning, permission boundaries, path validation, cap threshold, and unique run directories verified. |
 | CH2-02 — Executing a fake Copilot process and preserving artifacts | Complete | PASS (15 focused tests; 1 platform skip) | `e4ebdbf` | Fake-process success, nonzero exit with partial output, launch failure, and missing-artifact failure. |
-| CH2-03 — Parsing usage and classifying outcomes | Pending | — | — | |
+| CH2-03 — Parsing usage and classifying outcomes | Verification passed; commit pending | PASS (24 focused tests; 1 platform skip), then PASS (25; 1 skip) | — | Usage validation, model matching, budget signals, malformed output, fail-closed cases, and timeout precedence. |
 | CH2-04 — Preflight and Windows timeout recovery | Pending | — | — | |
 | CH2-05 — Runner integration contract and regression | Pending | — | — | |
 
@@ -41,6 +41,18 @@
 - **Regression:** Full suite not rerun for CH2-02 yet.
 - **Reviewed scope:** `factory/runner.py`, `tests/test_runner.py`, and this progress record.
 - **Checkpoint SHA:** `e4ebdbf`.
+
+## CH2-03 checkpoint
+
+- **Technical check:** Local `copilot help billing` does not document the JSON usage schema. Microsoft VS Code source represents `modelMetrics` as a model-keyed object and uses a string `currentModel`; implementation accepts `currentModel` or exactly one model key and fails closed on ambiguity.
+- **RED:** `.venv\Scripts\python.exe -m unittest discover -s tests -p test_runner.py -k parses_usage_and_preserves_unknown_fields -v` failed because usage was returned as an unvalidated dictionary. `.venv\Scripts\python.exe -m unittest discover -s tests -p test_runner.py -k usage_at_cap -v` failed because reaching the cap returned `OK`.
+- **Implementation started:** Added strict nano-AIU/model parsing, preserved raw unknown usage fields, JSONL event inspection, model matching, and ordered TIMEOUT/BUDGET/OK/ERROR classification.
+- **Test-harness correction:** The first expanded focused run had 10 errors because its fake `Popen` helper used positional parameter names that did not match the runner's keyword arguments. Updated the helper to accept `stdout`/`stderr`; no production-code failure was involved.
+- **GREEN:** `.venv\Scripts\python.exe -m unittest discover -s tests -p test_runner.py -v` — 24 tests passed; the native symlink test was skipped because Windows symlink creation requires an unavailable privilege. Added an explicit timeout-over-budget precedence case, then reran the same command — 25 tests passed, 1 platform skip.
+- **Additional checks:** `.venv\Scripts\python.exe -m compileall -q factory tests` and `git -c core.whitespace=cr-at-eol diff --check` — passed.
+- **Coverage:** Valid usage and unknown-field preservation, credit cap and explicit rate-limit budget signals, timeout precedence, model mismatch and single-key fallback, malformed/missing usage and JSONL, non-budget nonzero exit, and retained artifacts.
+- **Reviewed scope:** `factory/runner.py`, `tests/test_runner.py`, and this progress record.
+- **Checkpoint SHA:** Pending commit.
 
 ## Checkpoint policy
 

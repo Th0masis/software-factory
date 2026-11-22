@@ -4,6 +4,7 @@ import shutil
 import stat
 import subprocess
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from itertools import count
 from pathlib import Path
 from typing import Literal
@@ -28,16 +29,122 @@ _FORBIDDEN_ALLOW_TOOLS = {
     "--allow-all-urls",
     "--yolo",
 }
+_SESSION_LIMIT_MESSAGE = re.compile(
+    r"\b(?:rate|usage|session|ai[\s-]+credit)\s+limit\b",
+    re.IGNORECASE,
+)
+_SESSION_LIMIT_TYPES = {
+    "ai_credit_limit",
+    "rate_limit",
+    "session_limit",
+    "usage_limit",
+}
 
 
 @dataclass(frozen=True)
 class RunResult:
     outcome: Literal["OK", "BUDGET", "TIMEOUT", "ERROR"]
     exit_code: int | None
-    usage: dict | None
+    usage: "Usage | None"
     session_id: str | None
     paths: dict[str, Path]
     error: str | None
+
+
+@dataclass(frozen=True)
+class Usage:
+    total_nano_aiu: Decimal
+    effective_model: str
+    raw: dict
+
+    @property
+    def credits(self):
+        return self.total_nano_aiu / Decimal(1_000_000_000)
+
+
+class UsageError(ValueError):
+    pass
+
+
+def _parse_usage(data):
+    if not isinstance(data, dict):
+        raise UsageError("usage.json must contain a JSON object")
+
+    total_nano_aiu = data.get("totalNanoAiu")
+    if isinstance(total_nano_aiu, bool) or not isinstance(
+        total_nano_aiu, (int, float)
+    ):
+        raise UsageError("usage.totalNanoAiu must be numeric")
+    try:
+        total_nano_aiu = Decimal(str(total_nano_aiu))
+    except InvalidOperation as error:
+        raise UsageError("usage.totalNanoAiu must be numeric") from error
+    if not total_nano_aiu.is_finite() or total_nano_aiu < 0:
+        raise UsageError("usage.totalNanoAiu must be finite and non-negative")
+
+    if "currentModel" in data:
+        effective_model = data["currentModel"]
+        if (
+            not isinstance(effective_model, str)
+            or not effective_model
+            or effective_model != effective_model.strip()
+        ):
+            raise UsageError("usage.currentModel must be a non-empty model name")
+    else:
+        model_metrics = data.get("modelMetrics")
+        if not isinstance(model_metrics, dict) or len(model_metrics) != 1:
+            raise UsageError("usage must identify exactly one effective model")
+        effective_model = next(iter(model_metrics))
+        if not isinstance(effective_model, str) or not effective_model.strip():
+            raise UsageError("usage.modelMetrics contains an invalid model name")
+
+    return Usage(total_nano_aiu, effective_model, data)
+
+
+def _read_jsonl(path):
+    records = []
+    errors = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as error:
+        return records, [f"cannot read stdout.jsonl: {error}"]
+    for line_number, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as error:
+            errors.append(f"invalid stdout.jsonl line {line_number}: {error}")
+            continue
+        if not isinstance(record, dict):
+            errors.append(f"stdout.jsonl line {line_number} must be a JSON object")
+            continue
+        records.append(record)
+    return records, errors
+
+
+def _has_session_limit(records):
+    for record in records:
+        event_type = record.get("type")
+        if not isinstance(event_type, str):
+            continue
+        data = record.get("data")
+        if not isinstance(data, dict):
+            data = record
+        if event_type in {"session.budget_exhausted", "session.limit"}:
+            return True
+        if event_type == "session.error":
+            error_type = data.get("errorType")
+            if isinstance(error_type, str) and error_type.lower() in _SESSION_LIMIT_TYPES:
+                return True
+        if event_type == "session.info":
+            info_type = data.get("infoType")
+            message = data.get("message")
+            if isinstance(info_type, str) and info_type.lower() in _SESSION_LIMIT_TYPES:
+                return True
+            if isinstance(message, str) and _SESSION_LIMIT_MESSAGE.search(message):
+                return True
+    return False
 
 
 def _validate_profile(role, profile, config):
@@ -286,33 +393,56 @@ def run_agent(role, profile, task_file, cwd, session_name):
 
     artifact_errors = []
     try:
-        usage = json.loads(paths["usage"].read_text(encoding="utf-8"))
-        if not isinstance(usage, dict):
-            artifact_errors.append("usage.json must contain a JSON object")
-            usage = None
+        usage = _parse_usage(json.loads(paths["usage"].read_text(encoding="utf-8")))
     except FileNotFoundError:
         usage = None
         artifact_errors.append("usage.json was not created")
-    except (OSError, json.JSONDecodeError) as error:
+    except (OSError, json.JSONDecodeError, UsageError) as error:
         usage = None
         artifact_errors.append(f"cannot read usage.json: {error}")
     if not paths["session"].is_file():
         artifact_errors.append("session.md was not created")
+    jsonl_records, jsonl_errors = _read_jsonl(paths["stdout"])
+    artifact_errors.extend(jsonl_errors)
+    try:
+        stderr_text = paths["stderr"].read_text(
+            encoding="utf-8", errors="replace"
+        ).strip()
+    except OSError as error:
+        stderr_text = ""
+        artifact_errors.append(f"cannot read stderr.log: {error}")
 
-    session_id = usage.get("sessionId") if usage else None
+    session_id = usage.raw.get("sessionId") if usage else None
     if not isinstance(session_id, str):
         session_id = None
+    budget_reached = _has_session_limit(jsonl_records) or (
+        usage is not None
+        and usage.total_nano_aiu
+        >= Decimal(profile.max_ai_credits) * Decimal(1_000_000_000)
+    )
     if timed_out:
         outcome = "TIMEOUT"
         error = "Copilot process exceeded the configured timeout"
+    elif budget_reached:
+        outcome = "BUDGET"
+        error = "Copilot session budget limit reached"
     elif exit_code == 0 and not artifact_errors:
-        outcome = "OK"
-        error = None
+        if usage.effective_model == profile.model:
+            outcome = "OK"
+            error = None
+        else:
+            outcome = "ERROR"
+            error = (
+                f"effective model {usage.effective_model!r} does not match "
+                f"configured model {profile.model!r}"
+            )
     else:
         outcome = "ERROR"
         errors = artifact_errors
         if exit_code != 0:
             errors = [f"Copilot exited with status {exit_code}", *errors]
+        if stderr_text:
+            errors.append(f"see stderr log: {paths['stderr']}")
         error = "; ".join(errors) or "Copilot process failed"
 
     return RunResult(
