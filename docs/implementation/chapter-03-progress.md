@@ -22,7 +22,7 @@
 
 | Slice | Status | Tests | Commit SHA | Notes |
 |---|---|---|---|---|
-| CH3-01 — Reading changes and enforcing scope/protection | Complete | PASS (14 focused tests) | `42256b8` | Includes protected-pattern parser regression coverage |
+| CH3-01 — Reading changes and enforcing scope/protection | Complete | PASS (14 focused tests) | `42256b8`, `bc0af21` | `bc0af21` fixes protected-pattern comment parsing |
 | CH3-02 — Running and validating project checks | Complete | PASS (29 focused Gate tests) | `ba560ae` | Depends on CH3-01 |
 | CH3-03 — Producing a Gate report and exposing the CLI | Targeted tests pass; chapter acceptance blocked | PASS (8 CLI integration tests) | `95b67db` | Existing Runner regression tests fail |
 
@@ -156,7 +156,7 @@
 - **Review finding disposition:** No regular-file mode check was added for
   `.factory/protected.txt`; the approved contract requires it to exist and be tracked but does not
   require a regular non-symlink file.
-- **Parser repair commit:** Not created yet.
+- **Parser repair commit:** `bc0af21` (`fix: parse protected patterns per contract`).
 
 ## Checkpoint policy
 
