@@ -1,6 +1,6 @@
 # Chapter 3 — Progress
 
-- **Overall status:** Implementation in progress; Chapter 3 regression acceptance is blocked.
+- **Overall status:** Chapter 3 implementation and regression acceptance complete.
 - **Current branch:** `feat/chapter-03-gate`
 - **Contract:** [`chapter-03.md`](./chapter-03.md)
 - **Design deltas:** [`design-deviations.md`](./design-deviations.md)
@@ -11,20 +11,17 @@
   and review-repair task lifecycle clarified.
 - **Verified:** Documentation whitespace checks passed; `design.md` is unchanged. The topic branch
   is local and based on fetched `origin/main`.
-- **Current slice:** Protected-pattern parser review repair is verified; Chapter 3 acceptance
-  remains blocked by the Runner regression tests.
-- **Remaining:** Resolve or establish the baseline for the Runner timeout-test failures before
-  declaring Chapter 3 complete.
-- **Blockers:** `test_runner.py` has two failing 0.25-second timeout tests; baseline against
-  pre-CH3-02 Runner code is unverified.
+- **Current slice:** Deterministic Runner timeout tests verified; Chapter 3 acceptance complete.
+- **Remaining:** None.
+- **Blockers:** None.
 
 ## Slice status
 
 | Slice | Status | Tests | Commit SHA | Notes |
 |---|---|---|---|---|
 | CH3-01 — Reading changes and enforcing scope/protection | Complete | PASS (14 focused tests) | `42256b8`, `bc0af21` | `bc0af21` fixes protected-pattern comment parsing |
-| CH3-02 — Running and validating project checks | Complete | PASS (29 focused Gate tests) | `ba560ae` | Depends on CH3-01 |
-| CH3-03 — Producing a Gate report and exposing the CLI | Targeted tests pass; chapter acceptance blocked | PASS (8 CLI integration tests) | `95b67db` | Existing Runner regression tests fail |
+| CH3-02 — Running and validating project checks | Complete | PASS (29 Gate; 36 Runner, 1 skipped) | `ba560ae` | Depends on CH3-01 |
+| CH3-03 — Producing a Gate report and exposing the CLI | Complete | PASS (103 passed, 1 skipped; 104 total) | `95b67db` | Runner timeout tests now synchronize on startup |
 
 ## Baseline and contract checkpoint
 
@@ -98,15 +95,11 @@
   script content.
 - **Platform output detail:** Assertions treat captured line endings platform-independently; the
   initial byte-for-byte LF expectation was incorrect for Windows and was corrected.
-- **Regression runs:** `test_gate.py` — 29 tests passed. `test_job_create.py` — 29 tests passed.
-  The existing Runner successful-contained-process test also passed after the launcher update.
-  `test_runner.py` completed with 2 failures and 1 skipped; both failures were in 0.25-second
-  timeout tests that did not capture their startup marker. Rerunning each test in isolation
-  reproduced the failures. The Runner launcher preserves its previous arguments when no explicit
-  environment is supplied; the failures appear tied to the tests' short startup timeout, but the
-  baseline status remains unverified.
-- **Latest focused check:** `uv run --python 3.14 python -m unittest discover -s tests -p test_gate.py -v`
-  — all 29 tests passed after the changed/missing-script FAIL behavior and strict JSON validation.
+- **Regression runs before deterministic startup synchronization:** `test_gate.py` — 29 tests
+  passed; `test_job_create.py` — 29 tests passed. `test_runner.py` had two failures in
+  0.25-second timeout tests because startup output was not observed before timeout.
+- **Latest Gate regression:** `uv run --python 3.14 python -m unittest discover -s tests -p test_gate.py -v`
+  — all 30 tests passed after adding the protected-pattern parser regression.
 - **CH3-03 RED:** `uv run --python 3.14 python -m unittest discover -s tests -p test_gate_cli.py -v`
   failed because `factory job gate` is not registered. Its integration fixture creates an attached
   job with a passing target checks script and asserts persisted report output plus unchanged job
@@ -130,19 +123,15 @@
 - **CH3-03 regression:** `uv run --python 3.14 python -m unittest discover -s tests -p test_gate_cli.py -v`
   — all 8 CLI integration tests passed.
 - **CH3-03 Gate regression:** `uv run --python 3.14 python -m unittest discover -s tests -p test_gate.py -v`
-  — all 29 unit and process tests passed.
+  — all 30 unit and process tests passed.
 - **CH3-03 scope reviewed:** `factory/cli.py`, `factory/gate.py`, `tests/test_gate_cli.py`, and this
   progress record. `design.md` remains unchanged.
 - **Reviewed scope:** `factory/job.py`, `factory/runner.py`, `factory/gate.py`,
   `tests/test_gate.py`, and this progress file.
 - **Documentation checks:** `git -c core.whitespace=cr-at-eol diff --check` passed.
   `design.md` remained unchanged.
-- **Chapter 1/2 regression gate:** `uv run --python 3.14 python -m unittest discover -s tests -p test_runner.py -v`
-  completed with 2 failures and 1 skip. Both failures are 0.25-second timeout tests that did not
-  capture the child startup marker; each also failed when rerun alone. The prior
-  `test_job_create.py` run passed all 29 tests. The CH3-02 Runner change preserves the original
-  process arguments when no environment is supplied, but a pre-CH3-02 baseline was not run;
-  Chapter 3 regression acceptance therefore remains unverified.
+- **Chapter 1/2 regression gate:** `test_job_create.py` — 29 passed;
+  `test_runner.py` — 36 passed, 1 skipped because Windows symlink creation is unavailable.
 - **Reviewed scope:** `docs/implementation/chapter-03.md`, this progress file,
   `docs/implementation/design-deviations.md`, and `docs/README.md`.
 - **CH3-03 implementation commit:** `95b67db` (`feat: expose Gate reports and CLI`).
@@ -157,6 +146,15 @@
   `.factory/protected.txt`; the approved contract requires it to exist and be tracked but does not
   require a regular non-symlink file.
 - **Parser repair commit:** `bc0af21` (`fix: parse protected patterns per contract`).
+- **Runner timeout-test RED:** The two timeout tests failed because the `started` output marker
+  was absent when the 0.25-second timeout expired.
+- **Runner timeout-test GREEN:** The child now signals startup, the parent waits for that signal
+  before emitting its marker, and the test launcher waits for the parent's marker before returning
+  control to `run_agent`. Both targeted tests and all 36 non-skipped Runner tests passed.
+- **Complete regression suite:** `uv run --python 3.14 python -m unittest discover -s tests -v`
+  — 103 passed, 1 skipped (104 total). `compileall` and the repository-configured diff
+  whitespace check passed.
+- **Runner test repair commit:** Not created yet.
 
 ## Checkpoint policy
 
