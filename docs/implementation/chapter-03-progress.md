@@ -154,7 +154,7 @@
 - **Complete regression suite:** `uv run --python 3.14 python -m unittest discover -s tests -v`
   — 103 passed, 1 skipped (104 total). `compileall` and the repository-configured diff
   whitespace check passed.
-- **Runner test repair commit:** Not created yet.
+- **Runner test repair commit:** `0d8a6c5` (`test: make Runner timeout tests deterministic`).
 
 ## Checkpoint policy
 
