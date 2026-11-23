@@ -4,6 +4,8 @@
 - **Source:** [`design.md`](../../design.md), Chapter 3 and related Chapters 1, 2, 4, 7, 8, and 9
 - **Dependencies:** [`chapter-01.md`](./chapter-01.md), [`chapter-02.md`](./chapter-02.md), [`design-deviations.md`](./design-deviations.md)
 - **Specification review:** completed 2026-11-22
+- **Approved Chapter 4 extension:** behavior approved 2026-11-23; its implementation contract is
+  [`chapter-04.md`](./chapter-04.md).
 
 This contract defines the factory-side Gate and its target-project checks interface. It does not
 modify `design.md`. Implementation starts only after explicit approval of this contract.
@@ -23,9 +25,11 @@ modify `design.md`. Implementation starts only after explicit approval of this c
 
 - A factory-side Gate service and CLI entry point for an attached job worktree.
 - A trusted scope-manifest input, safe path-pattern matching, and protected-path checks.
-- A target-project `.factory/checks.py` contract with `--fast` and `--full` modes.
+- A target-project `.factory/checks.py` contract with baseline, fast, and full checks, including
+  optional slice selection for the Chapter 4 TDD extension.
 - A bounded, shell-free checks process with known secret environment variables removed.
 - Strict checks JSON validation and a persisted `gate-report.json` with diagnostics.
+- The approved Chapter 4 extension for baseline and slice-selected TDD checks; see §2.
 - Focused unit and temporary-Git integration tests, including failure and timeout cases.
 - An implementation progress record once implementation begins.
 
@@ -61,7 +65,8 @@ modify `design.md`. Implementation starts only after explicit approval of this c
 
 - This is **Chapter 3 — Gate** in `design.md`. The Copilot Runner is Chapter 2 and is already
   implemented under the approved Chapter 2 contract.
-- Factory Gate invokes the target project's `.factory/checks.py` using `--fast` or `--full`.
+- Factory Gate invokes the target project's `.factory/checks.py` for baseline, selected-slice, or
+  full checks. Exact arguments are specified by the approved Chapter 4 contract.
 - The checks script must be unchanged from the supplied base SHA before it is executed. Remove
   configured secret environment variables and enforce a timeout. This limits accidental exposure;
   it does not sandbox trusted project code.
@@ -92,9 +97,29 @@ modify `design.md`. Implementation starts only after explicit approval of this c
   output. Exclude it from change checks only while untracked; if it is staged or committed as a
   worktree change, Gate FAILs. Do not ignore other untracked paths.
 
-### Proposed details for contract approval
+### Approved Chapter 4 extension — 2026-11-23
 
-- CLI: `factory job gate JOB_ID --base SHA --mode fast|full`.
+- Gate supports a baseline check that excludes pending job TDD tests, a selected-slice check that
+  runs only the locked tests mapped to that slice, and a final full check after all slices pass.
+- M1 input registration uses a separate target-checks `--red --manifest PATH
+  --baseline-sha SHA` invocation. It verifies TDD readiness and does not produce a Gate verdict.
+- The red report binds test results to the locked manifest hash and attached branch's
+  `work_branch_start_sha`; its schema is defined in the approved Chapter 4 contract.
+- Slice selection does not bypass change-scope or protected-path checks.
+- Gate remains state-neutral and does not mark a slice or feature as passed. The Chapter 4
+  orchestrator records the result and owns all job-state transitions.
+- A final Gate PASS is required before the orchestrator advances the job from `GATE` to `REVIEW`.
+- Exact CLI spelling and checks-script arguments are specified in the approved
+  [`chapter-04.md`](./chapter-04.md).
+
+### Gate interface details
+
+- Base CLI: `factory job gate JOB_ID --base SHA --mode fast|full`.
+- Approved Chapter 4 extension CLI: `factory job gate JOB_ID --base SHA --mode baseline|fast|full
+  [--slice SLICE_ID]`. The target checks interface receives the corresponding baseline, selected
+  slice, or full-check request. `--slice` is valid only for a slice-selected fast check.
+- M1 red-check CLI: `.factory/checks.py --red --manifest PATH --baseline-sha SHA`; this is an
+  input-readiness check, separate from `factory job gate`.
 - The scope file is JSON stored outside the target worktree and controlled by the factory:
 
   ```json
@@ -144,6 +169,7 @@ modify `design.md`. Implementation starts only after explicit approval of this c
     "job_id": "job-id",
     "base_sha": "full-commit-sha",
     "mode": "fast",
+    "slice_id": null,
     "checks": [{"name": "unit", "status": "PASS", "exit_code": 0}],
     "scope": {"changed_paths": [], "violations": []},
     "protected_paths": {"violations": []},
@@ -304,6 +330,8 @@ The contract and this document must be approved before any implementation begins
 - In-scope changes pass scope checks; unchanged protected paths pass protection checks.
 - A valid checks script returns schema-valid JSON, exit `0`, and all checks `PASS`.
 - Both `--fast` and `--full` are forwarded unchanged to the project script.
+- The approved Chapter 4 extension excludes pending TDD tests from baseline checks and runs only
+  the selected slice's locked tests when a slice is specified.
 - Gate writes a report and captured logs without changing job state or journal.
 
 ### Negative cases

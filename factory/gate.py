@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import re
@@ -335,9 +336,81 @@ def _validate_secret_env_vars(config):
     return secret_names
 
 
-def run_checks(worktree, base_sha, mode, config):
-    if not isinstance(mode, str) or mode not in {"fast", "full"}:
-        raise ConfigurationError("mode must be 'fast' or 'full'")
+def _parse_baseline_red_report(stdout, baseline_sha, manifest_sha256, test_ids):
+    try:
+        report = json.loads(
+            stdout,
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (ValueError, UnicodeDecodeError) as error:
+        raise ValueError(f"baseline-red stdout is not valid JSON: {error}") from error
+    if (
+        not isinstance(report, dict)
+        or type(report.get("schema_version")) is not int
+        or report["schema_version"] != 1
+        or report.get("work_branch_start_sha") != baseline_sha
+        or report.get("manifest_sha256") != manifest_sha256
+    ):
+        raise ValueError("baseline-red report metadata does not match registered inputs")
+    results = report.get("tests")
+    if not isinstance(results, list) or len(results) != len(test_ids):
+        raise ValueError("baseline-red report must contain each registered test once")
+    result_ids = []
+    for result in results:
+        if not isinstance(result, dict):
+            raise ValueError("each baseline-red result must be an object")
+        test_id = result.get("id")
+        outcome = result.get("outcome")
+        if (
+            not isinstance(test_id, str)
+            or not test_id
+            or not isinstance(outcome, str)
+            or outcome not in {"ASSERTION_FAILURE", "PASS", "ERROR"}
+        ):
+            raise ValueError("baseline-red result has an invalid ID or outcome")
+        result_ids.append(test_id)
+    if len(set(result_ids)) != len(result_ids) or set(result_ids) != set(test_ids):
+        raise ValueError("baseline-red report test IDs do not match the manifest")
+    return report
+
+
+def run_checks(
+    worktree,
+    base_sha,
+    mode,
+    config,
+    *,
+    manifest_path=None,
+    manifest_sha256=None,
+    test_ids=None,
+):
+    if not isinstance(mode, str) or mode not in {"fast", "full", "red"}:
+        raise ConfigurationError("mode must be 'fast', 'full', or 'red'")
+    if mode == "red":
+        if (
+            not isinstance(manifest_path, Path)
+            or not manifest_path.is_absolute()
+            or manifest_path.is_symlink()
+            or not isinstance(manifest_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", manifest_sha256) is None
+            or not isinstance(test_ids, (list, tuple))
+            or not test_ids
+            or any(not isinstance(test_id, str) or not test_id for test_id in test_ids)
+            or len(set(test_ids)) != len(test_ids)
+        ):
+            raise ConfigurationError("invalid baseline-red check inputs")
+        try:
+            if (
+                not manifest_path.is_file()
+                or hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+                != manifest_sha256
+            ):
+                raise ConfigurationError("registered test manifest is missing or changed")
+        except OSError as error:
+            raise ConfigurationError(
+                f"cannot read registered test manifest: {error}"
+            ) from error
     if not isinstance(config, FactoryConfig):
         raise ConfigurationError("config must be a validated factory config")
     secret_names = _validate_secret_env_vars(config)
@@ -378,8 +451,21 @@ def run_checks(worktree, base_sha, mode, config):
     exit_code = None
     try:
         try:
+            arguments = [sys.executable, ".factory/checks.py"]
+            if mode == "red":
+                arguments.extend(
+                    [
+                        "--red",
+                        "--manifest",
+                        str(manifest_path),
+                        "--baseline-sha",
+                        base_sha,
+                    ]
+                )
+            else:
+                arguments.append(f"--{mode}")
             process = _spawn_process(
-                [sys.executable, ".factory/checks.py", f"--{mode}"],
+                arguments,
                 cwd=worktree,
                 stdin=subprocess.DEVNULL,
                 stdout=stdout,
@@ -415,9 +501,43 @@ def run_checks(worktree, base_sha, mode, config):
     report = None
     if error is None:
         try:
-            report, checks = _parse_checks_report(stdout_data)
+            if mode == "red":
+                if manifest_path.is_symlink() or (
+                    hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+                    != manifest_sha256
+                ):
+                    raise ValueError("registered test manifest changed during baseline-red check")
+                report = _parse_baseline_red_report(
+                    stdout_data, base_sha, manifest_sha256, test_ids
+                )
+            else:
+                report, checks = _parse_checks_report(stdout_data)
         except ValueError as report_error:
             error = str(report_error)
+        except OSError as report_error:
+            error = f"cannot read registered test manifest: {report_error}"
+    if mode == "red":
+        all_checks_passed = (
+            isinstance(report, dict)
+            and all(
+                result["outcome"] == "ASSERTION_FAILURE"
+                for result in report["tests"]
+            )
+        )
+        passed = error is None and exit_code == 0 and all_checks_passed
+        if error is None and exit_code:
+            error = f"baseline-red check exited with status {exit_code}"
+        elif error is None and not all_checks_passed:
+            error = "baseline-red check did not report assertion failures for every test"
+        return ChecksResult(
+            verdict="PASS" if passed else "FAIL",
+            report=report,
+            checks=checks,
+            exit_code=exit_code,
+            stdout=stdout_data,
+            stderr=stderr_data,
+            error=error,
+        )
     all_checks_passed = bool(checks) and all(
         check["status"] == "PASS" and check["exit_code"] == 0
         for check in checks

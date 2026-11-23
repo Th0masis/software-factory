@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -132,14 +133,112 @@ class JobCreateCliTests(unittest.TestCase):
             "Repair widget",
         )
         job_id = json.loads(created.stdout)["job_id"]
-        current = job_service.read_job(factory_root, job_id)
-        job_service._record_state_change(
-            factory_root / "jobs" / job_id,
-            current,
-            "SPEC_APPROVED",
-            "Spec approved for worktree test",
+        spec_path = temp_root / "approved-spec.md"
+        spec_path.write_bytes(b"# Approved specification\n")
+        approved = self._run_cli(
+            factory_root,
+            env,
+            "job",
+            "prepare",
+            job_id,
+            "--stage",
+            "spec",
+            "--path",
+            str(spec_path),
+            "--approve",
         )
+        self.assertEqual(approved.returncode, 0, approved.stderr)
         return factory_root, target_repo, env, job_id, branch, branch_sha
+
+    def _prepare_baseline_red_job(self, temp_root):
+        (
+            factory_root,
+            target_repo,
+            env,
+            job_id,
+            branch,
+            _,
+        ) = self._prepare_approved_worktree_job(temp_root)
+        subprocess.run(
+            ["git", "checkout", "--quiet", branch],
+            cwd=target_repo,
+            check=True,
+        )
+        (target_repo / "tests").mkdir()
+        (target_repo / "tests" / "test_widget.py").write_text(
+            "def test_acceptance():\n    assert False\n",
+            encoding="utf-8",
+        )
+        (target_repo / ".factory" / "checks.py").write_text(
+            "import argparse\n"
+            "import hashlib\n"
+            "import json\n"
+            "import os\n"
+            "from pathlib import Path\n"
+            "parser = argparse.ArgumentParser()\n"
+            "parser.add_argument('--red', action='store_true')\n"
+            "parser.add_argument('--manifest', required=True)\n"
+            "parser.add_argument('--baseline-sha', required=True)\n"
+            "args = parser.parse_args()\n"
+            "manifest = Path(args.manifest).read_bytes()\n"
+            "tests = json.loads(manifest)['tests']\n"
+            "if os.environ.get('FACTORY_TEST_MUTATE_INPUT'):\n"
+            "    Path(tests[0]['path']).write_text('modified\\n', encoding='utf-8')\n"
+            "manifest_sha256 = hashlib.sha256(manifest).hexdigest()\n"
+            "if os.environ.get('FACTORY_TEST_BAD_MANIFEST_SHA'):\n"
+            "    manifest_sha256 = '0' * 64\n"
+            "outcome = os.environ.get('FACTORY_TEST_RED_OUTCOME', "
+            "'ASSERTION_FAILURE')\n"
+            "print(json.dumps({"
+            "'schema_version': 1, "
+            "'work_branch_start_sha': args.baseline_sha, "
+            "'manifest_sha256': manifest_sha256, "
+            "'tests': [{'id': test['id'], 'outcome': outcome} "
+            "for test in tests]}))\n",
+            encoding="utf-8",
+        )
+        subprocess.run(
+            ["git", "add", "tests/test_widget.py", ".factory/checks.py"],
+            cwd=target_repo,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "commit", "--quiet", "-m", "add TDD test and checks"],
+            cwd=target_repo,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "checkout", "--quiet", "main"],
+            cwd=target_repo,
+            check=True,
+        )
+        attached = self._run_cli(
+            factory_root,
+            env,
+            "job",
+            "worktree",
+            "attach",
+            job_id,
+            "--branch",
+            branch,
+        )
+        self.assertEqual(attached.returncode, 0, attached.stderr)
+        manifest_path = temp_root / "approved-tests.json"
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "tests": [
+                        {
+                            "id": "tests.test_widget.test_acceptance",
+                            "path": "tests/test_widget.py",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return factory_root, target_repo, env, job_id, manifest_path
 
     def test_new_creates_metadata_without_branch_or_worktree(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -171,6 +270,477 @@ class JobCreateCliTests(unittest.TestCase):
             self.assertEqual(job["worktree_status"], "not_attached")
             self.assertEqual(events[0]["type"], "JOB_CREATED")
             self.assertFalse((factory_root / "worktrees").exists())
+
+    def test_prepare_approved_spec_records_hash_and_advances_state(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            factory_root, target_repo, env = self._prepare_repositories(Path(temp_dir))
+            created = self._run_cli(
+                factory_root,
+                env,
+                "job",
+                "new",
+                "--project",
+                str(target_repo),
+                "--title",
+                "Repair widget",
+            )
+            job_id = json.loads(created.stdout)["job_id"]
+            spec_content = "# Repair widget\n\nApproved acceptance criteria.\n"
+            spec_path = Path(temp_dir) / "approved-spec.md"
+            spec_path.write_bytes(spec_content.encode("utf-8"))
+
+            prepared = self._run_cli(
+                factory_root,
+                env,
+                "job",
+                "prepare",
+                job_id,
+                "--stage",
+                "spec",
+                "--path",
+                str(spec_path),
+                "--approve",
+            )
+
+            self.assertEqual(prepared.returncode, 0, prepared.stderr)
+            output = json.loads(prepared.stdout)
+            self.assertEqual(output["job"]["state"], "SPEC_APPROVED")
+            self.assertEqual(
+                output["last_event"]["input_sha256"],
+                hashlib.sha256(spec_content.encode("utf-8")).hexdigest(),
+            )
+            self.assertEqual(output["last_event"]["input_path"], "spec.md")
+            self.assertEqual(
+                (factory_root / "jobs" / job_id / "spec.md").read_text(
+                    encoding="utf-8"
+                ),
+                spec_content,
+            )
+
+    def test_prepare_spec_without_human_approval_preserves_job(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            factory_root, target_repo, env = self._prepare_repositories(Path(temp_dir))
+            created = self._run_cli(
+                factory_root,
+                env,
+                "job",
+                "new",
+                "--project",
+                str(target_repo),
+                "--title",
+                "Repair widget",
+            )
+            job_id = json.loads(created.stdout)["job_id"]
+            spec_path = Path(temp_dir) / "proposed-spec.md"
+            spec_path.write_bytes(b"# Proposed specification\n")
+
+            prepared = self._run_cli(
+                factory_root,
+                env,
+                "job",
+                "prepare",
+                job_id,
+                "--stage",
+                "spec",
+                "--path",
+                str(spec_path),
+            )
+
+            self.assertEqual(prepared.returncode, 2)
+            status = self._run_cli(factory_root, env, "job", "status", job_id)
+            output = json.loads(status.stdout)
+            self.assertEqual(output["job"]["state"], "DRAFT_SPEC")
+            self.assertEqual(output["last_event"]["seq"], 1)
+            self.assertFalse((factory_root / "jobs" / job_id / "spec.md").exists())
+
+    def test_prepare_spec_after_approval_preserves_locked_input(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            factory_root, target_repo, env = self._prepare_repositories(Path(temp_dir))
+            created = self._run_cli(
+                factory_root,
+                env,
+                "job",
+                "new",
+                "--project",
+                str(target_repo),
+                "--title",
+                "Repair widget",
+            )
+            job_id = json.loads(created.stdout)["job_id"]
+            spec_path = Path(temp_dir) / "approved-spec.md"
+            spec_path.write_bytes(b"# Approved specification\n")
+            prepare_args = (
+                "job",
+                "prepare",
+                job_id,
+                "--stage",
+                "spec",
+                "--path",
+                str(spec_path),
+                "--approve",
+            )
+            approved = self._run_cli(factory_root, env, *prepare_args)
+            self.assertEqual(approved.returncode, 0, approved.stderr)
+            events_path = factory_root / "jobs" / job_id / "events.jsonl"
+            original_events = events_path.read_bytes()
+
+            repeated = self._run_cli(factory_root, env, *prepare_args)
+
+            self.assertEqual(repeated.returncode, 2)
+            status = self._run_cli(factory_root, env, "job", "status", job_id)
+            output = json.loads(status.stdout)
+            self.assertEqual(output["job"]["state"], "SPEC_APPROVED")
+            self.assertEqual(output["last_event"]["seq"], 2)
+            self.assertEqual(events_path.read_bytes(), original_events)
+            self.assertEqual(
+                (factory_root / "jobs" / job_id / "spec.md").read_bytes(),
+                spec_path.read_bytes(),
+            )
+
+    def test_prepare_approved_tests_records_manifest_after_baseline_red(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (
+                factory_root,
+                _,
+                env,
+                job_id,
+                manifest_path,
+            ) = self._prepare_baseline_red_job(Path(temp_dir))
+
+            registered = self._run_cli(
+                factory_root,
+                env,
+                "job",
+                "prepare",
+                job_id,
+                "--stage",
+                "tests",
+                "--path",
+                str(manifest_path),
+                "--approve",
+            )
+
+            self.assertEqual(registered.returncode, 0, registered.stderr)
+            status = self._run_cli(factory_root, env, "job", "status", job_id)
+            self.assertEqual(status.returncode, 0, status.stderr)
+            output = json.loads(status.stdout)
+            stored_manifest = (
+                factory_root / "jobs" / job_id / "tests.json"
+            ).read_bytes()
+            self.assertEqual(output["job"]["state"], "TESTS_RED_OK")
+            self.assertEqual(output["last_event"]["to"], "TESTS_RED_OK")
+            report_path = (
+                factory_root / "jobs" / job_id / output["last_event"]["red_report_path"]
+            )
+            self.assertTrue(report_path.is_file())
+            self.assertEqual(
+                output["last_event"]["red_report_sha256"],
+                hashlib.sha256(report_path.read_bytes()).hexdigest(),
+            )
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                report["work_branch_start_sha"],
+                output["job"]["work_branch_start_sha"],
+            )
+            self.assertNotEqual(
+                report["work_branch_start_sha"],
+                output["job"]["base_sha"],
+            )
+            events = [
+                json.loads(line)
+                for line in (
+                    factory_root / "jobs" / job_id / "events.jsonl"
+                ).read_text(encoding="utf-8").splitlines()
+            ]
+            tests_written = next(
+                event for event in events if event.get("to") == "TESTS_WRITTEN"
+            )
+            self.assertEqual(
+                tests_written["input_sha256"],
+                hashlib.sha256(stored_manifest).hexdigest(),
+            )
+            self.assertEqual(
+                json.loads(stored_manifest)["tests"][0]["sha256"],
+                hashlib.sha256(
+                    (
+                        Path(output["job"]["worktree_path"])
+                        / "tests"
+                        / "test_widget.py"
+                    ).read_bytes()
+                ).hexdigest(),
+            )
+
+    def test_prepare_tests_retries_failed_baseline_red_without_unlocking_manifest(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (
+                factory_root,
+                _,
+                env,
+                job_id,
+                manifest_path,
+            ) = self._prepare_baseline_red_job(Path(temp_dir))
+            env["FACTORY_TEST_RED_OUTCOME"] = "PASS"
+            arguments = (
+                "job",
+                "prepare",
+                job_id,
+                "--stage",
+                "tests",
+                "--path",
+                str(manifest_path),
+                "--approve",
+            )
+
+            rejected = self._run_cli(factory_root, env, *arguments)
+
+            self.assertEqual(rejected.returncode, 1)
+            self.assertIn("assertion failures for every test", rejected.stderr)
+            status = self._run_cli(factory_root, env, "job", "status", job_id)
+            self.assertEqual(status.returncode, 0, status.stderr)
+            self.assertEqual(json.loads(status.stdout)["job"]["state"], "TESTS_WRITTEN")
+            self.assertEqual(
+                len(list((factory_root / "jobs" / job_id / "tests-red").iterdir())),
+                1,
+            )
+
+            env.pop("FACTORY_TEST_RED_OUTCOME")
+            retried = self._run_cli(factory_root, env, *arguments)
+
+            self.assertEqual(retried.returncode, 0, retried.stderr)
+            status = self._run_cli(factory_root, env, "job", "status", job_id)
+            self.assertEqual(status.returncode, 0, status.stderr)
+            self.assertEqual(json.loads(status.stdout)["job"]["state"], "TESTS_RED_OK")
+            self.assertEqual(
+                len(list((factory_root / "jobs" / job_id / "tests-red").iterdir())),
+                2,
+            )
+
+    def test_prepare_tests_requires_human_approval_without_changing_job(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (
+                factory_root,
+                _,
+                env,
+                job_id,
+                manifest_path,
+            ) = self._prepare_baseline_red_job(Path(temp_dir))
+            events_path = factory_root / "jobs" / job_id / "events.jsonl"
+            original_events = events_path.read_bytes()
+
+            rejected = self._run_cli(
+                factory_root,
+                env,
+                "job",
+                "prepare",
+                job_id,
+                "--stage",
+                "tests",
+                "--path",
+                str(manifest_path),
+            )
+
+            self.assertEqual(rejected.returncode, 2)
+            self.assertIn("requires explicit --approve", rejected.stderr)
+            status = self._run_cli(factory_root, env, "job", "status", job_id)
+            self.assertEqual(json.loads(status.stdout)["job"]["state"], "SPEC_APPROVED")
+            self.assertEqual(events_path.read_bytes(), original_events)
+            self.assertFalse((factory_root / "jobs" / job_id / "tests.json").exists())
+
+    def test_prepare_tests_rejects_mismatched_baseline_red_manifest_hash(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (
+                factory_root,
+                _,
+                env,
+                job_id,
+                manifest_path,
+            ) = self._prepare_baseline_red_job(Path(temp_dir))
+            env["FACTORY_TEST_BAD_MANIFEST_SHA"] = "1"
+
+            rejected = self._run_cli(
+                factory_root,
+                env,
+                "job",
+                "prepare",
+                job_id,
+                "--stage",
+                "tests",
+                "--path",
+                str(manifest_path),
+                "--approve",
+            )
+
+            self.assertEqual(rejected.returncode, 1)
+            self.assertIn("metadata does not match registered inputs", rejected.stderr)
+            events = [
+                json.loads(line)
+                for line in (
+                    factory_root / "jobs" / job_id / "events.jsonl"
+                ).read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(events[-1]["to"], "TESTS_WRITTEN")
+
+    def test_prepare_tests_rejects_path_outside_worktree_without_registration(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (
+                factory_root,
+                _,
+                env,
+                job_id,
+                manifest_path,
+            ) = self._prepare_baseline_red_job(Path(temp_dir))
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "tests": [
+                            {
+                                "id": "tests.test_widget.test_acceptance",
+                                "path": "../README.md",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            rejected = self._run_cli(
+                factory_root,
+                env,
+                "job",
+                "prepare",
+                job_id,
+                "--stage",
+                "tests",
+                "--path",
+                str(manifest_path),
+                "--approve",
+            )
+
+            self.assertEqual(rejected.returncode, 2)
+            self.assertIn("safe repository-relative POSIX path", rejected.stderr)
+            status = self._run_cli(factory_root, env, "job", "status", job_id)
+            self.assertEqual(json.loads(status.stdout)["job"]["state"], "SPEC_APPROVED")
+            self.assertFalse((factory_root / "jobs" / job_id / "tests.json").exists())
+            self.assertFalse((factory_root / "jobs" / job_id / "tests-red").exists())
+
+    def test_prepare_tests_rechecks_locked_files_after_baseline_red(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (
+                factory_root,
+                _,
+                env,
+                job_id,
+                manifest_path,
+            ) = self._prepare_baseline_red_job(Path(temp_dir))
+            env["FACTORY_TEST_MUTATE_INPUT"] = "1"
+
+            rejected = self._run_cli(
+                factory_root,
+                env,
+                "job",
+                "prepare",
+                job_id,
+                "--stage",
+                "tests",
+                "--path",
+                str(manifest_path),
+                "--approve",
+            )
+
+            self.assertEqual(rejected.returncode, 1)
+            self.assertIn("registered tests changed during baseline-red check", rejected.stderr)
+            events = [
+                json.loads(line)
+                for line in (
+                    factory_root / "jobs" / job_id / "events.jsonl"
+                ).read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(events[-1]["to"], "TESTS_WRITTEN")
+            self.assertTrue(
+                (factory_root / "jobs" / job_id / "tests-red").is_dir()
+            )
+
+    def test_status_rejects_modified_registered_test(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (
+                factory_root,
+                _,
+                env,
+                job_id,
+                manifest_path,
+            ) = self._prepare_baseline_red_job(Path(temp_dir))
+            registered = self._run_cli(
+                factory_root,
+                env,
+                "job",
+                "prepare",
+                job_id,
+                "--stage",
+                "tests",
+                "--path",
+                str(manifest_path),
+                "--approve",
+            )
+            self.assertEqual(registered.returncode, 0, registered.stderr)
+            status = self._run_cli(factory_root, env, "job", "status", job_id)
+            self.assertEqual(status.returncode, 0, status.stderr)
+            test_path = (
+                Path(json.loads(status.stdout)["job"]["worktree_path"])
+                / "tests"
+                / "test_widget.py"
+            )
+            test_path.write_text("def test_acceptance():\n    assert True\n", encoding="utf-8")
+            events_path = factory_root / "jobs" / job_id / "events.jsonl"
+            original_events = events_path.read_bytes()
+
+            rejected = self._run_cli(factory_root, env, "job", "status", job_id)
+
+            self.assertEqual(rejected.returncode, 2)
+            self.assertIn("registered test file hash mismatch", rejected.stderr)
+            self.assertEqual(events_path.read_bytes(), original_events)
+
+    def test_status_rejects_modified_approved_spec(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            factory_root, target_repo, env = self._prepare_repositories(Path(temp_dir))
+            created = self._run_cli(
+                factory_root,
+                env,
+                "job",
+                "new",
+                "--project",
+                str(target_repo),
+                "--title",
+                "Repair widget",
+            )
+            job_id = json.loads(created.stdout)["job_id"]
+            spec_path = Path(temp_dir) / "approved-spec.md"
+            spec_path.write_bytes(b"# Approved spec\n")
+            prepared = self._run_cli(
+                factory_root,
+                env,
+                "job",
+                "prepare",
+                job_id,
+                "--stage",
+                "spec",
+                "--path",
+                str(spec_path),
+                "--approve",
+            )
+            self.assertEqual(prepared.returncode, 0, prepared.stderr)
+
+            events_path = factory_root / "jobs" / job_id / "events.jsonl"
+            original_events = events_path.read_bytes()
+            (factory_root / "jobs" / job_id / "spec.md").write_bytes(
+                b"# Changed spec\n"
+            )
+
+            status = self._run_cli(factory_root, env, "job", "status", job_id)
+
+            self.assertEqual(status.returncode, 2)
+            self.assertIn("registered spec hash mismatch", status.stderr)
+            self.assertEqual(events_path.read_bytes(), original_events)
 
     def test_worktree_attach_uses_existing_approved_local_branch(self):
         with tempfile.TemporaryDirectory() as temp_dir:

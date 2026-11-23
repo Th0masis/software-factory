@@ -1,10 +1,13 @@
 import getpass
+import hashlib
 import json
 import os
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from pathlib import PurePosixPath
 import re
+import stat
 import subprocess
 import tempfile
 from typing import Literal
@@ -345,6 +348,228 @@ def _write_snapshot(path, job):
         temporary_path.unlink(missing_ok=True)
 
 
+def _strict_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value):
+    raise ValueError(f"non-standard JSON constant: {value}")
+
+
+def _parse_test_manifest(content):
+    try:
+        manifest = json.loads(
+            content,
+            object_pairs_hook=_strict_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (ValueError, UnicodeDecodeError) as error:
+        raise ConfigurationError(f"invalid test manifest: {error}") from error
+    if (
+        not isinstance(manifest, dict)
+        or set(manifest) != {"schema_version", "tests"}
+        or type(manifest["schema_version"]) is not int
+        or manifest["schema_version"] != 1
+        or not isinstance(manifest["tests"], list)
+        or not manifest["tests"]
+    ):
+        raise ConfigurationError(
+            "test manifest must contain schema_version 1 and a non-empty tests list"
+        )
+    return manifest
+
+
+def _test_file_hash(worktree, relative_path):
+    if (
+        not isinstance(relative_path, str)
+        or not relative_path
+        or "\\" in relative_path
+        or relative_path.startswith("/")
+        or re.match(r"^[A-Za-z]:", relative_path)
+        or any(part in {"", ".", ".."} for part in relative_path.split("/"))
+        or not PurePosixPath(relative_path).parts
+    ):
+        raise ConfigurationError("test path must be a safe repository-relative POSIX path")
+    parts = relative_path.split("/")
+    candidate = worktree
+    try:
+        if stat.S_ISLNK(worktree.lstat().st_mode):
+            raise ConfigurationError("worktree path must not be a symlink")
+        for index, part in enumerate(parts):
+            candidate = candidate / part
+            mode = candidate.lstat().st_mode
+            if stat.S_ISLNK(mode):
+                raise ConfigurationError(
+                    f"test path must not contain symlinks: {relative_path}"
+                )
+            if index < len(parts) - 1 and not stat.S_ISDIR(mode):
+                raise ConfigurationError(
+                    f"test path parent must be a directory: {relative_path}"
+                )
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ConfigurationError(f"test file is missing or invalid: {relative_path}") from error
+    if not stat.S_ISREG(mode):
+        raise ConfigurationError(f"test path must be a regular non-symlink file: {relative_path}")
+    try:
+        resolved.relative_to(worktree)
+    except ValueError as error:
+        raise ConfigurationError(f"test path escapes the worktree: {relative_path}") from error
+    try:
+        content = candidate.read_bytes()
+    except OSError as error:
+        raise ConfigurationError(f"cannot read test file {relative_path}: {error}") from error
+    return hashlib.sha256(content).hexdigest()
+
+
+def _normalize_test_manifest(manifest, worktree):
+    worktree = Path(worktree).resolve(strict=True)
+    records = []
+    identifiers = set()
+    for test in manifest["tests"]:
+        if not isinstance(test, dict) or set(test) != {"id", "path"}:
+            raise ConfigurationError("each test must contain only an id and path")
+        test_id = test["id"]
+        relative_path = test["path"]
+        if not isinstance(test_id, str) or not test_id.strip():
+            raise ConfigurationError("test ID must be a non-empty string")
+        if test_id in identifiers:
+            raise ConfigurationError(f"duplicate test ID: {test_id}")
+        identifiers.add(test_id)
+        records.append(
+            {
+                "id": test_id,
+                "path": relative_path,
+                "sha256": _test_file_hash(worktree, relative_path),
+            }
+        )
+    return {"schema_version": 1, "tests": records}
+
+
+def _validate_registered_tests(job_dir, job, expected_sha256):
+    tests_path = job_dir / "tests.json"
+    if tests_path.is_symlink() or not tests_path.is_file():
+        raise ConfigurationError("registered test manifest is missing or invalid")
+    try:
+        content = tests_path.read_bytes()
+    except OSError as error:
+        raise ConfigurationError(f"cannot read registered test manifest: {error}") from error
+    if hashlib.sha256(content).hexdigest() != expected_sha256:
+        raise ConfigurationError("registered test manifest hash mismatch")
+    if not job.worktree_path or job.worktree_status != "attached":
+        raise ConfigurationError("registered tests require an attached worktree")
+    worktree_path = Path(job.worktree_path)
+    if worktree_path.is_symlink() or not worktree_path.is_dir():
+        raise ConfigurationError("registered test worktree is missing or invalid")
+    manifest = _parse_test_manifest(content)
+    if any(
+        not isinstance(test, dict)
+        or set(test) != {"id", "path", "sha256"}
+        or not isinstance(test["sha256"], str)
+        or re.fullmatch(r"[0-9a-f]{64}", test["sha256"]) is None
+        for test in manifest["tests"]
+    ):
+        raise ConfigurationError("registered test manifest contains an invalid test")
+    source_manifest = {
+        "schema_version": 1,
+        "tests": [
+            {"id": test["id"], "path": test["path"]}
+            for test in manifest["tests"]
+        ],
+    }
+    normalized = _normalize_test_manifest(
+        _parse_test_manifest(json.dumps(source_manifest)),
+        Path(job.worktree_path),
+    )
+    if manifest != normalized:
+        raise ConfigurationError("registered test file hash mismatch")
+    return content, manifest
+
+
+def _validate_red_report(job_dir, job, event):
+    report_path = event.get("red_report_path")
+    report_sha256 = event.get("red_report_sha256")
+    if (
+        not isinstance(report_path, str)
+        or not isinstance(report_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", report_sha256) is None
+    ):
+        raise ConfigurationError("invalid baseline-red report metadata")
+    parts = report_path.split("/")
+    if (
+        len(parts) != 3
+        or parts[0] != "tests-red"
+        or parts[1] in {"", ".", ".."}
+        or parts[2] != "red-report.json"
+    ):
+        raise ConfigurationError("invalid baseline-red report path")
+    try:
+        if str(UUID(parts[1])) != parts[1]:
+            raise ValueError
+    except ValueError as error:
+        raise ConfigurationError("invalid baseline-red report attempt ID") from error
+    attempts_dir = job_dir / parts[0]
+    attempt_dir = attempts_dir / parts[1]
+    stored_path = job_dir.joinpath(*parts)
+    if (
+        attempts_dir.is_symlink()
+        or not attempts_dir.is_dir()
+        or attempt_dir.is_symlink()
+        or not attempt_dir.is_dir()
+        or stored_path.is_symlink()
+        or not stored_path.is_file()
+    ):
+        raise ConfigurationError("baseline-red report is missing or invalid")
+    try:
+        content = stored_path.read_bytes()
+    except OSError as error:
+        raise ConfigurationError(f"cannot read baseline-red report: {error}") from error
+    if hashlib.sha256(content).hexdigest() != report_sha256:
+        raise ConfigurationError("baseline-red report hash mismatch")
+    try:
+        report = json.loads(
+            content,
+            object_pairs_hook=_strict_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (ValueError, UnicodeDecodeError) as error:
+        raise ConfigurationError(f"invalid baseline-red report: {error}") from error
+    tests_path = job_dir / "tests.json"
+    try:
+        manifest_hash = hashlib.sha256(tests_path.read_bytes()).hexdigest()
+    except OSError as error:
+        raise ConfigurationError(f"cannot read registered test manifest: {error}") from error
+    _, manifest = _validate_registered_tests(job_dir, job, manifest_hash)
+    results = report.get("tests") if isinstance(report, dict) else None
+    result_ids = [
+        result.get("id")
+        for result in results
+        if isinstance(result, dict)
+    ] if isinstance(results, list) else []
+    if (
+        not isinstance(report, dict)
+        or type(report.get("schema_version")) is not int
+        or report["schema_version"] != 1
+        or report.get("work_branch_start_sha") != job.work_branch_start_sha
+        or report.get("manifest_sha256") != manifest_hash
+        or len(result_ids) != len(manifest["tests"])
+        or any(not isinstance(test_id, str) for test_id in result_ids)
+        or set(result_ids) != {test["id"] for test in manifest["tests"]}
+        or len(set(result_ids)) != len(result_ids)
+        or any(
+            not isinstance(result, dict)
+            or result.get("outcome") != "ASSERTION_FAILURE"
+            for result in results
+        )
+    ):
+        raise ConfigurationError("baseline-red report does not match registered tests")
+
+
 def _read_event_log(path, job_id):
     try:
         contents = path.read_text(encoding="utf-8")
@@ -446,6 +671,80 @@ def _read_event_log(path, job_id):
                 if expected_job != event_job:
                     raise ConfigurationError(
                         f"invalid state event data for job {job_id}"
+                    )
+                is_spec_approval = (
+                    event["type"] == "JOB_STATE_CHANGED"
+                    and job.state == "DRAFT_SPEC"
+                    and event_job.state == "SPEC_APPROVED"
+                )
+                is_tests_written = (
+                    event["type"] == "JOB_STATE_CHANGED"
+                    and job.state == "SPEC_APPROVED"
+                    and event_job.state == "TESTS_WRITTEN"
+                )
+                is_tests_red = (
+                    event["type"] == "JOB_STATE_CHANGED"
+                    and job.state == "TESTS_WRITTEN"
+                    and event_job.state == "TESTS_RED_OK"
+                )
+                has_input_metadata = any(
+                    key in event for key in ("input_path", "input_sha256")
+                )
+                has_red_metadata = any(
+                    key in event
+                    for key in ("red_report_path", "red_report_sha256")
+                )
+                if is_spec_approval:
+                    input_path = event.get("input_path")
+                    input_sha256 = event.get("input_sha256")
+                    if (
+                        input_path != "spec.md"
+                        or not isinstance(input_sha256, str)
+                        or not re.fullmatch(r"[0-9a-f]{64}", input_sha256)
+                    ):
+                        raise ConfigurationError(
+                            f"invalid registered spec metadata for job {job_id}"
+                        )
+                    registered_spec = path.parent / "spec.md"
+                    if registered_spec.is_symlink() or not registered_spec.is_file():
+                        raise ConfigurationError(
+                            f"registered spec is missing or invalid for job {job_id}"
+                        )
+                    try:
+                        registered_hash = hashlib.sha256(
+                            registered_spec.read_bytes()
+                        ).hexdigest()
+                    except OSError as error:
+                        raise ConfigurationError(
+                            f"cannot read registered spec for job {job_id}: {error}"
+                        ) from error
+                    if registered_hash != input_sha256:
+                        raise ConfigurationError(
+                            f"registered spec hash mismatch for job {job_id}"
+                        )
+                elif is_tests_written:
+                    input_sha256 = event.get("input_sha256")
+                    if (
+                        event.get("input_path") != "tests.json"
+                        or not isinstance(input_sha256, str)
+                        or re.fullmatch(r"[0-9a-f]{64}", input_sha256) is None
+                        or has_red_metadata
+                    ):
+                        raise ConfigurationError(
+                            f"invalid registered test metadata for job {job_id}"
+                        )
+                    _validate_registered_tests(
+                        path.parent, event_job, input_sha256
+                    )
+                elif is_tests_red:
+                    if has_input_metadata or not has_red_metadata:
+                        raise ConfigurationError(
+                            f"invalid baseline-red event metadata for job {job_id}"
+                        )
+                    _validate_red_report(path.parent, event_job, event)
+                elif has_input_metadata or has_red_metadata:
+                    raise ConfigurationError(
+                        f"unexpected registered input metadata for job {job_id}"
                     )
             elif event["type"] == "WORKTREE_ATTACH_STARTED":
                 if (
@@ -653,7 +952,7 @@ def _persist_event(job_dir, event, updated):
     return {"job": updated.model_dump(mode="json"), "last_event": event}
 
 
-def _record_state_change(job_dir, current, target, reason, resuming=False):
+def _record_state_change(job_dir, current, target, reason, resuming=False, details=None):
     job = JobRecord.model_validate(current["job"])
     is_resume = (
         resuming
@@ -684,8 +983,254 @@ def _record_state_change(job_dir, current, target, reason, resuming=False):
         "to": target,
         "data": updated.model_dump(mode="json"),
     }
+    if details:
+        event.update(details)
 
     return _persist_event(job_dir, event, updated)
+
+
+def register_spec(factory_root, job_id, spec_path, approved):
+    if not approved:
+        raise ConfigurationError("spec registration requires explicit --approve")
+
+    source_path = Path(spec_path)
+    if source_path.is_symlink():
+        raise ConfigurationError("spec path must not be a symlink")
+    try:
+        source_path = source_path.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ConfigurationError(f"invalid spec path: {spec_path}") from error
+    if not source_path.is_file():
+        raise ConfigurationError(f"spec path is not a regular file: {spec_path}")
+    try:
+        content = source_path.read_bytes()
+    except OSError as error:
+        raise ConfigurationError(f"cannot read spec {spec_path}: {error}") from error
+    if not content.strip():
+        raise ConfigurationError("spec file must not be empty")
+
+    job_id, job_dir = _job_location(factory_root, job_id)
+    spec_hash = hashlib.sha256(content).hexdigest()
+    with _job_lock(job_dir):
+        current = _read_job_contents(job_dir, job_id)
+        job = JobRecord.model_validate(current["job"])
+        if job.state != "DRAFT_SPEC":
+            raise ConfigurationError("spec registration requires DRAFT_SPEC")
+
+        stored_spec = job_dir / "spec.md"
+        if stored_spec.is_symlink() or (
+            stored_spec.exists() and not stored_spec.is_file()
+        ):
+            raise ConfigurationError(f"invalid stored spec path: {stored_spec}")
+        if stored_spec.exists():
+            try:
+                stored_content = stored_spec.read_bytes()
+            except OSError as error:
+                raise FactoryError(f"cannot read stored spec: {error}") from error
+            if stored_content != content:
+                raise FactoryError("an unregistered spec artifact already exists")
+        else:
+            temporary_path = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="wb",
+                    dir=job_dir,
+                    prefix=".spec-",
+                    suffix=".tmp",
+                    delete=False,
+                ) as temporary:
+                    temporary_path = Path(temporary.name)
+                    temporary.write(content)
+                    temporary.flush()
+                    os.fsync(temporary.fileno())
+                os.replace(temporary_path, stored_spec)
+            finally:
+                if temporary_path is not None:
+                    temporary_path.unlink(missing_ok=True)
+
+        return _record_state_change(
+            job_dir,
+            current,
+            "SPEC_APPROVED",
+            "Approved specification registered",
+            details={
+                "input_path": "spec.md",
+                "input_sha256": spec_hash,
+            },
+        )
+
+
+def _write_durable_artifact(path, content):
+    with path.open("xb") as stream:
+        stream.write(content)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _write_baseline_red_artifacts(job_dir, result):
+    attempts_dir = job_dir / "tests-red"
+    if attempts_dir.is_symlink() or (
+        attempts_dir.exists() and not attempts_dir.is_dir()
+    ):
+        raise FactoryError("invalid baseline-red artifact directory")
+    try:
+        attempts_dir.mkdir(exist_ok=True)
+        attempt_dir = attempts_dir / str(uuid4())
+        attempt_dir.mkdir()
+        report_path = attempt_dir / "red-report.json"
+        _write_durable_artifact(report_path, result.stdout)
+        _write_durable_artifact(
+            attempt_dir / "checks.stdout.txt", result.stdout
+        )
+        _write_durable_artifact(
+            attempt_dir / "checks.stderr.txt", result.stderr
+        )
+        result_summary = json.dumps(
+            {
+                "verdict": result.verdict,
+                "exit_code": result.exit_code,
+                "error": result.error,
+            },
+            indent=2,
+            sort_keys=True,
+        ) + "\n"
+        _write_durable_artifact(
+            attempt_dir / "result.json", result_summary.encode("utf-8")
+        )
+    except OSError as error:
+        raise FactoryError(f"cannot write baseline-red artifacts: {error}") from error
+    return report_path
+
+
+def register_tests(factory_root, job_id, manifest_path, approved):
+    if not approved:
+        raise ConfigurationError("test registration requires explicit --approve")
+
+    source_path = Path(manifest_path)
+    if source_path.is_symlink():
+        raise ConfigurationError("test manifest path must not be a symlink")
+    try:
+        source_path = source_path.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ConfigurationError(f"invalid test manifest path: {manifest_path}") from error
+    if not source_path.is_file():
+        raise ConfigurationError(f"test manifest path is not a regular file: {manifest_path}")
+    try:
+        source_content = source_path.read_bytes()
+    except OSError as error:
+        raise ConfigurationError(f"cannot read test manifest: {error}") from error
+
+    job_id, job_dir = _job_location(factory_root, job_id)
+    with _job_lock(job_dir):
+        current = _read_job_contents(job_dir, job_id)
+        job = JobRecord.model_validate(current["job"])
+        if job.state not in {"SPEC_APPROVED", "TESTS_WRITTEN"}:
+            raise ConfigurationError(
+                "test registration requires SPEC_APPROVED or TESTS_WRITTEN"
+            )
+        if (
+            job.worktree_status != "attached"
+            or not job.worktree_path
+            or not job.work_branch_start_sha
+        ):
+            raise ConfigurationError("test registration requires an attached worktree")
+        worktree_path = Path(job.worktree_path)
+        if worktree_path.is_symlink() or not worktree_path.is_dir():
+            raise ConfigurationError("test registration worktree is missing or invalid")
+        manifest = _normalize_test_manifest(
+            _parse_test_manifest(source_content), worktree_path
+        )
+        normalized_content = (
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        stored_tests = job_dir / "tests.json"
+        if stored_tests.is_symlink() or (
+            stored_tests.exists() and not stored_tests.is_file()
+        ):
+            raise ConfigurationError("invalid stored test manifest path")
+        if job.state == "SPEC_APPROVED":
+            if stored_tests.exists():
+                if stored_tests.read_bytes() != normalized_content:
+                    raise FactoryError("an unregistered test manifest already exists")
+            else:
+                temporary_path = None
+                try:
+                    with tempfile.NamedTemporaryFile(
+                        mode="wb",
+                        dir=job_dir,
+                        prefix=".tests-",
+                        suffix=".tmp",
+                        delete=False,
+                    ) as temporary:
+                        temporary_path = Path(temporary.name)
+                        temporary.write(normalized_content)
+                        temporary.flush()
+                        os.fsync(temporary.fileno())
+                    os.replace(temporary_path, stored_tests)
+                finally:
+                    if temporary_path is not None:
+                        temporary_path.unlink(missing_ok=True)
+            input_sha256 = hashlib.sha256(normalized_content).hexdigest()
+            current = _record_state_change(
+                job_dir,
+                current,
+                "TESTS_WRITTEN",
+                "Approved TDD test manifest registered",
+                details={
+                    "input_path": "tests.json",
+                    "input_sha256": input_sha256,
+                },
+            )
+        else:
+            registered_content = stored_tests.read_bytes()
+            if registered_content != normalized_content:
+                raise FactoryError("registered test manifest is locked")
+            input_sha256 = hashlib.sha256(registered_content).hexdigest()
+
+        from .gate import run_checks
+
+        config = _load_model(Path(factory_root) / "config.json", FactoryConfig)
+        result = run_checks(
+            worktree_path,
+            job.work_branch_start_sha,
+            "red",
+            config,
+            manifest_path=stored_tests.resolve(strict=True),
+            manifest_sha256=input_sha256,
+            test_ids=[test["id"] for test in manifest["tests"]],
+        )
+        report_path = _write_baseline_red_artifacts(job_dir, result)
+        if result.verdict != "PASS":
+            raise FactoryError(
+                f"baseline-red check failed: {result.error or 'invalid report'}; "
+                f"diagnostics: {report_path.parent}"
+            )
+        try:
+            _validate_registered_tests(
+                job_dir,
+                JobRecord.model_validate(current["job"]),
+                input_sha256,
+            )
+        except ConfigurationError as error:
+            raise FactoryError(
+                f"registered tests changed during baseline-red check: {error}; "
+                f"diagnostics: {report_path.parent}"
+            ) from error
+
+        report_relative_path = report_path.relative_to(job_dir).as_posix()
+        completed = _record_state_change(
+            job_dir,
+            current,
+            "TESTS_RED_OK",
+            "Baseline-red TDD tests verified",
+            details={
+                "red_report_path": report_relative_path,
+                "red_report_sha256": hashlib.sha256(
+                    report_path.read_bytes()
+                ).hexdigest(),
+            },
+        )
+        return completed
 
 
 def _record_worktree_event(job_dir, current, event_type, reason, changes):

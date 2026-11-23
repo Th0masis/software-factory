@@ -12,6 +12,8 @@ from .job import (
     attach_worktree,
     create_job,
     list_jobs,
+    register_spec,
+    register_tests,
     read_job,
     release_worktree,
     repair_worktree,
@@ -28,6 +30,11 @@ def _parser():
     new = job_commands.add_parser("new")
     new.add_argument("--project", required=True, type=Path)
     new.add_argument("--title", required=True)
+    prepare = job_commands.add_parser("prepare")
+    prepare.add_argument("job_id")
+    prepare.add_argument("--stage", choices=("spec", "tests"), required=True)
+    prepare.add_argument("--path", required=True, type=Path)
+    prepare.add_argument("--approve", action="store_true")
     status = job_commands.add_parser("status")
     status.add_argument("job_id")
     transition = job_commands.add_parser("transition")
@@ -61,6 +68,15 @@ def main(argv=None):
     try:
         if args.job_command == "new":
             result = create_job(Path.cwd(), args.project, args.title)
+        elif args.job_command == "prepare":
+            if args.stage == "spec":
+                result = register_spec(
+                    Path.cwd(), args.job_id, args.path, args.approve
+                )
+            else:
+                result = register_tests(
+                    Path.cwd(), args.job_id, args.path, args.approve
+                )
         elif args.job_command == "status":
             result = read_job(Path.cwd(), args.job_id)
         elif args.job_command == "transition":
