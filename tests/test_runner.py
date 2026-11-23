@@ -130,6 +130,32 @@ class RunnerCommandTests(unittest.TestCase):
                     "repair-widget",
                 )
 
+    def _spawn_after_startup_marker(self, startup_marker):
+        original_spawn = runner_module._spawn_process
+
+        def spawn(*arguments, **options):
+            process = original_spawn(*arguments, **options)
+            deadline = time.monotonic() + 10
+            while (
+                not startup_marker.is_file()
+                and process.poll() is None
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
+            if not startup_marker.is_file():
+                try:
+                    if process.poll() is None:
+                        process._factory_job.terminate()
+                        process.wait()
+                finally:
+                    runner_module._close_process_tree(process)
+                raise AssertionError(
+                    "test process did not reach its startup marker"
+                )
+            return process
+
+        return spawn
+
     def test_build_command_pins_profile_permissions_and_artifact_paths(self):
         command = self._build_command()
 
@@ -479,18 +505,27 @@ class RunnerCommandTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "nt", "Windows process-tree verification")
     def test_run_agent_timeout_terminates_child_process(self):
         marker = Path(self.temp_dir.name) / "child-survived.txt"
+        child_started = Path(self.temp_dir.name) / "child-started.txt"
+        parent_started = Path(self.temp_dir.name) / "parent-started.txt"
         child_code = (
             "import time; from pathlib import Path; "
+            f"Path({str(child_started)!r}).touch(); "
             f"time.sleep(1.5); Path({str(marker)!r}).write_text('survived')"
         )
         parent_code = (
-            "import subprocess, sys, time; "
+            "import subprocess, sys, time\n"
+            "from pathlib import Path\n"
             f"subprocess.Popen([sys.executable, '-c', {child_code!r}]); "
-            "print('started', flush=True); "
-            "time.sleep(60)"
+            f"child_started = Path({str(child_started)!r})\n"
+            "while not child_started.is_file():\n"
+            "    time.sleep(0.01)\n"
+            "print('started', flush=True)\n"
+            f"Path({str(parent_started)!r}).touch()\n"
+            "time.sleep(60)\n"
         )
         run_dir = Path(self.temp_dir.name) / "run"
         run_dir.mkdir()
+        spawn_after_startup = self._spawn_after_startup_marker(parent_started)
 
         original_which = shutil.which
         with patch(
@@ -498,21 +533,25 @@ class RunnerCommandTests(unittest.TestCase):
             side_effect=lambda name: None if name == "taskkill" else original_which(name),
         ):
             with patch(
-                "factory.runner._prepare_command",
-                return_value=(
-                    [sys.executable, "-c", parent_code],
-                    run_dir,
-                    0.25,
-                    self.cwd,
-                ),
+                "factory.runner._spawn_process",
+                side_effect=spawn_after_startup,
             ):
-                result = run_agent(
-                    "builder",
-                    self.profile,
-                    self.task_file,
-                    self.cwd,
-                    "repair-widget",
-                )
+                with patch(
+                    "factory.runner._prepare_command",
+                    return_value=(
+                        [sys.executable, "-c", parent_code],
+                        run_dir,
+                        0.25,
+                        self.cwd,
+                    ),
+                ):
+                    result = run_agent(
+                        "builder",
+                        self.profile,
+                        self.task_file,
+                        self.cwd,
+                        "repair-widget",
+                    )
 
         time.sleep(2)
         self.assertEqual(result.outcome, "TIMEOUT")
@@ -523,28 +562,42 @@ class RunnerCommandTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "nt", "Windows process-tree verification")
     def test_run_agent_closes_job_if_tree_termination_fails(self):
         marker = Path(self.temp_dir.name) / "child-survived.txt"
+        child_started = Path(self.temp_dir.name) / "child-started.txt"
+        parent_started = Path(self.temp_dir.name) / "parent-started.txt"
         child_code = (
             "import time; from pathlib import Path; "
+            f"Path({str(child_started)!r}).touch(); "
             f"time.sleep(1.5); Path({str(marker)!r}).write_text('survived')"
         )
         parent_code = (
-            "import subprocess, sys, time; "
+            "import subprocess, sys, time\n"
+            "from pathlib import Path\n"
             f"subprocess.Popen([sys.executable, '-c', {child_code!r}]); "
-            "print('started', flush=True); time.sleep(60)"
+            f"child_started = Path({str(child_started)!r})\n"
+            "while not child_started.is_file():\n"
+            "    time.sleep(0.01)\n"
+            "print('started', flush=True)\n"
+            f"Path({str(parent_started)!r}).touch()\n"
+            "time.sleep(60)\n"
         )
         run_dir = Path(self.temp_dir.name) / "run"
         run_dir.mkdir()
+        spawn_after_startup = self._spawn_after_startup_marker(parent_started)
         with patch(
             "factory.runner._prepare_command",
             return_value=([sys.executable, "-c", parent_code], run_dir, 0.25, self.cwd),
         ):
             with patch(
-                "factory.runner._terminate_process_tree",
-                side_effect=OSError("termination failed"),
+                "factory.runner._spawn_process",
+                side_effect=spawn_after_startup,
             ):
-                result = run_agent(
-                    "builder", self.profile, self.task_file, self.cwd, "test"
-                )
+                with patch(
+                    "factory.runner._terminate_process_tree",
+                    side_effect=OSError("termination failed"),
+                ):
+                    result = run_agent(
+                        "builder", self.profile, self.task_file, self.cwd, "test"
+                    )
         time.sleep(2)
         self.assertEqual(result.outcome, "ERROR")
         self.assertIn("termination failed", result.error)
