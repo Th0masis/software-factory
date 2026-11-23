@@ -18,7 +18,7 @@
 
 | Slice | Status | Tests | Commit SHA | Notes |
 |---|---|---|---|---|
-| CH4-01 — Registering human-approved M1 inputs | Complete | 40 job CLI, 30 Gate service, 8 Gate CLI tests passed; 7 new registration cases | — | Contract mapping prerequisite moved to CH4-02 |
+| CH4-01 — Registering human-approved M1 inputs | Complete | 40 job CLI, 30 Gate service, 8 Gate CLI tests passed; 7 new registration cases | `8c2d84f` | Contract mapping prerequisite moved to CH4-02 |
 | CH4-02 — Initializing and locking the slice plan | Pending | — | — | Depends on CH4-01 |
 | CH4-03 — Building and gating one TDD slice | Pending | — | — | Depends on CH4-02 |
 | CH4-04 — Recovering interrupted slices safely | Pending | — | — | Depends on CH4-01 through CH4-03 |
