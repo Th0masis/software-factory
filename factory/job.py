@@ -46,19 +46,6 @@ class RunnerConfig(BaseModel):
         return value
 
 
-class GateConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    timeout_seconds: int = 1800
-
-    @field_validator("timeout_seconds")
-    @classmethod
-    def validate_timeout(cls, value):
-        if value <= 0:
-            raise ValueError("timeout_seconds must be positive")
-        return value
-
-
 class RunnerProfile(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -89,7 +76,6 @@ class FactoryConfig(BaseModel):
     jobs_dir: str = "jobs"
     worktrees_dir: str = "worktrees"
     runner: RunnerConfig = RunnerConfig()
-    gate: GateConfig = GateConfig()
     profiles: dict[str, RunnerProfile] = {}
 
     @field_validator("jobs_dir", "worktrees_dir")
