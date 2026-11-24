@@ -1,6 +1,6 @@
 # Software Factory — design v0.1
 
-> Stav: návrh k diskusi · Poslední úprava: 2026-11-20
+> Stav: kanonický návrh; schválená rozhodnutí jsou evidována v `docs/implementation/design-deviations.md` · Poslední úprava: 2026-11-24
 > Inspirace: `zazencodes-season-3/src/software-factory-claude-code-v2` (jobs, gate, review, dashboard)
 > Další vstupy: Anthropic — *Effective harnesses for long-running agents*, *Harness design for long-running application development*
 
@@ -28,13 +28,14 @@ Pravidlo diskuse `[USER]`: protinávrh musí mít opodstatnění a přinést nov
 ## 1. Cíle, mimo rozsah, principy
 
 ### 1.1 Cíle `[USER]`
-- Zadání nebo issue → detailní specifikace → implementace po malých krocích → review → draft PR.
-- Specifikace vzniká interaktivně s agentem (grill-with-docs). Obsahuje definice, popis funkcí, schémata, zdroje a základní TDD testy.
+- Zadání nebo issue → detailní specifikace → implementace po malých krocích → Gate → review → člověk publikuje PR.
+- Specifikace vzniká interaktivně s agentem (grill-with-docs). Obsahuje definice, popis funkcí, schémata, zdroje a stabilně identifikovaná Acceptance Criteria (AC).
+- Test Author připraví nezávislé automatizované acceptance testy před Builderem; Builder implementuje feature po TDD slices a může doplnit další trvalé testy.
 - Při specifikaci se určí riziko. Podle rizika se pouští review agenti a testy.
 - Review agenti používají **jiný LLM než builder a spec-creator**.
 - Před návrhem PR běží shell gate (lint, unit, build, playwright, …).
 - Selhání se řeší ve zpětných smyčkách na několika úrovních, včetně spolupráce s člověkem.
-- Modely: střední tier na specifikaci (viz 1.3), levné na build, nejvyšší při zaseknutí.
+- Modely: nejsilnější dostupný model na specifikaci, role-specific profily na build a review.
 - Čistý kontext, malé kroky, chirurgické změny (KISS, ponytail skill).
 
 ### 1.2 Mimo rozsah verze 1
@@ -46,13 +47,15 @@ Pravidlo diskuse `[USER]`: protinávrh musí mít opodstatnění a přinést nov
 ### 1.3 Principy
 1. **Deterministické jádro, agenti jsou pracovníci.** Stav, přechody, gate, rozpočty a eskalace řídí kód. Agent nikdy nerozhoduje, že je hotovo. `[PROPOSED]`
 2. **Fail closed.** Chybějící report, neznámý stav nebo vyčerpaný rozpočet = nepokračovat.
-3. **Nezávislost kontroly.** Builder je Claude; testy, critic a review nejsou Claude. `[PROPOSED]` (hypotéza, měří se v kap. 11)
+3. **Nezávislost kontroly.** Test Author běží v samostatné session a profilu; odlišná modelová rodina je konfigurovatelná, ne povinná. Kvalitu nezávislosti vyhodnocují golden tasks v kap. 11.
 4. **Spec říká co a jak ověřit, ne jak implementovat.** Chybný technický detail ve specu se kaskádou propíše do kódu. `[PROPOSED]`
-5. **Testy jsou zamčené** a píše je jiná session než builder. `[PROPOSED]`
-6. **Malé kroky, čistý kontext.** Jedna feature = jedna session. Handoff přes soubory a git, ne přes paměť konverzace. `[USER]`
-7. **Prosazuj omezení kódem, ne promptem.** Scope manifest a diff budget kontroluje gate. `[PROPOSED]`
+5. **Nezávislé testy jsou zamčené.** Test Authorovy testy schvaluje člověk před Builderem a po checkpointu je Builder nesmí měnit ani odstranit bez nového schválení, hashe a baseline-red ověření. Builder může přidávat vlastní trvalé testy.
+6. **Malé kroky, čistý kontext.** Jeden slice = jedna Builder session. Handoff přes soubory a Git, ne přes paměť konverzace.
+7. **Prosazuj omezení kódem, ne promptem.** Scope manifest a protected-path pravidla kontroluje Gate.
 8. **Měř každou komponentu.** Každý agent a gate musí jít vypnout a dashboard ukáže, co reálně chytá. `[PROPOSED]`
-9. **Spec chce nejsilnější model.** Je to <1 % ceny a chyby se kaskádují. Nesouhlas s "střední model na spec" `[USER]` → diskuse D5.
+9. **Spec chce nejsilnější dostupný model.** Chyby ve specifikaci se kaskádují do testů a implementace.
+10. **Trvalé testy patří do projektu.** Testy chránící dlouhodobé chování jsou v existující testovací struktuře cílového projektu a jeho běžném test/CI procesu. Job-local zůstávají jen výslovně dočasné diagnostiky.
+11. **Gate neuhaduje.** Každé gating AC musí mít automatizované ověření. Chybějící, přeskočené nebo nespouštěné povinné ověření znamená FAIL; manuální kontrola není PASS Gate.
 
 ---
 
@@ -62,10 +65,11 @@ Pravidlo diskuse `[USER]`: protinávrh musí mít opodstatnění a přinést nov
 VS Code (front office)          Python orchestrátor (factory floor)           Dashboard (control room)
 ─────────────────────           ───────────────────────────────────           ────────────────────────
 grill-with-docs → spec.md  ──►  job state machine  (bin/factory job …)  ──►   čte jobs/*/events.jsonl
-spec critic (jiný vendor)       runner: copilot -p … (pinned profile)         cena / feature, verdikty,
-schválení G0 (člověk)           gate.py + .factory/checks.py                  eskalace, ablace
-                                review (jiný vendor) → draft PR (gh)
-                                člověk: schválí PR
+spec critic (jiný vendor)       Test Author (samostatná session/profile)      cena / feature, verdikty,
+schválení G0/G1 (člověk)        runner: copilot -p … (pinned profile)         eskalace, ablace
+                                gate.py + .factory/checks.py
+                                review (jiný vendor)
+                                člověk: publikuje po review
 ```
 
 ### 2.1 Pipeline a stavy
@@ -73,29 +77,32 @@ schválení G0 (člověk)           gate.py + .factory/checks.py                
 ```
 DRAFT_SPEC ─► SPEC_APPROVED ─► TESTS_WRITTEN ─► TESTS_RED_OK ─► BUILDING ─► GATE ─► REVIEW ─► READY_FOR_HUMAN ─► PR_OPEN ─► MERGED
    (G0 člověk)                                                       │         │        │
-                                                                     └─────────┴────────┴──► NEEDS_HUMAN / BUDGET_EXHAUSTED / FAILED
+                                                                     └─────────┴────────┴──► NEEDS_HUMAN / FAILED
 ```
 
+`BUDGET_EXHAUSTED` je důvod/událost; job přechází do `NEEDS_HUMAN`. Před `TESTS_RED_OK` u Test Author workflow proběhne Test Author, G1, baseline-red ověření a test-only checkpoint. Stavy zůstávají řízené orchestrátorem; přesné události a recovery definuje implementační kontrakt.
 Přechody provádí výhradně `factory job <příkaz>`. Nelegální přechod = chyba.
 
 ### 2.2 Adresářová struktura
 
 ```
-factory/                       # repo továrny `[OPEN]` D1: samostatné repo vs. vendored v projektu
+factory/                       # samostatné repo továrny (DD-01)
   config.json
   factory/                     # python balíček (job, runner, gate, route, review, report)
   agents/                      # *.agent.md (sdílené VS Code i Copilot CLI)
   prompts/
   jobs/<job-id>/
-    job.json                   # jediný zdroj pravdy o stavu
-    events.jsonl               # append-only log
+    job.json                   # atomický rebuildable snapshot
+    events.jsonl               # autoritativní append-only log
     spec.md  features.json  progress.md
+    tests.json                 # schválené Test Author testy, ID a hash
+    gate/<attempt-id>/         # neměnné reporty a logy
     runs/<n>/{usage.json,session.md,stdout.jsonl}
     verdicts/<reviewer>-<round>.json
   worktrees/<job-id>/          # git worktree cílového projektu
 ```
 
-V cílovém projektu: `.factory/checks.py` (kontrakt gate), `.factory/protected.txt`, `tests/factory/<job-id>/`.
+V cílovém projektu: `.factory/checks.py` (kontrakt gate), `.factory/protected.txt` a testy v existující testovací struktuře projektu. Factory nepředepisuje univerzální adresář; trvalé testy nejsou pouze v `jobs/<job-id>/`.
 
 ---
 
@@ -105,7 +112,7 @@ V cílovém projektu: `.factory/checks.py` (kontrakt gate), `.factory/protected.
 |---|---|---|
 | **M0** | spike | ověřené předpoklady o Copilot CLI (`spike.sh`) |
 | **M1** Walking skeleton | 1, 2, 3, 4 | ručně napsaný spec + testy → builder smyčka → gate → větev. Bez review a bez LLM specu. |
-| **M2** | 8 | review + draft PR |
+| **M2** | 8 | review; člověk publikuje po review |
 | **M3** | 5, 6 | interaktivní spec, test-author, red check |
 | **M4** | 7, 9 | risk routing, eskalace, práce s člověkem |
 | **M5** | 10 | dashboard |
@@ -123,42 +130,43 @@ Důvod pořadí: deterministická kostra a gate dávají hodnotu hned a bez nich
 
 **Návrh `[PROPOSED]`:**
 - Python 3.12, validace schémat přes `pydantic`.
-- `job.json`: `id, title, state, risk{declared, effective, reasons}, spec_hash, tests_hash, budgets{credits_job, credits_feature, used}, features_ref, session_ids, rounds{gate, review}`.
-- Každý přechod zapíše událost: `{ts, job, from, to, actor, reason}`.
+- `events.jsonl` je autoritativní append-only journal; `job.json` je atomicky aktualizovaný
+  snapshot, který lze z journalu obnovit.
+- Každý přechod zapíše událost: `{ts, job, from, to, actor, reason}`. Pozdější kapitoly přidají
+  pouze svá schémata a pole.
 - Zámek souboru při zápisu.
-- `job.json` navíc: `project, base_branch, base_sha, work_branch, pr_target`.
+- Job metadata zahrnují projekt, původní branch/base SHA a připojený worktree. Vypočítané údaje
+  a chapter-specific pole se ukládají až s příslušným kontraktem.
 
-**Cílový projekt a větve `[PROPOSED]`** (D14):
+**Cílový projekt a větve** (DD-03, DD-08, DD-14):
 
-Továrna žije ve vlastním repu. Kód mění vždy v **repu cílové aplikace**: `git worktree add` se volá nad ním, větev vzniká tam a worktree leží mimo něj (`factory/worktrees/<projekt>/<job-id>`). Kam se změny ukládají, určuje konfigurace projektu `.factory/project.json` (cestuje s repem a kolegové ji mají hned):
+Továrna žije ve vlastním repu. Kód mění vždy v **repu cílové aplikace**: worktree se připojí
+k existující připravené větvi a leží mimo cílový repozitář. Job nejprve vzniká jako metadata;
+po schválení specifikace člověk připraví nepoužívanou lokální větev a Factory ji připojí.
+Factory větev sama nevytváří, nemaže, neresetuje ani nepřepisuje.
+
+Konfigurace projektu `.factory/project.json` určuje cílový repozitář a kontroly:
 
 ```json
 {
   "project": "my-app",
   "remote": "origin",
   "base_branch": "develop",
-  "work_branch": "feature/{jira}-{slug}",
-  "pr_target": "develop",
-  "mode": "branch-per-job",
-  "checks": ".factory/checks.py",
-  "push": "orchestrator"
+  "checks": ".factory/checks.py"
 }
 ```
 
-- `base_branch`: odkud se větví a s čím se job rebasuje. Před startem `git fetch`, `base_sha` se zapíše do `job.json`.
-- `work_branch`: šablona názvu (`{job_id}`, `{slug}`, `{jira}`). Výchozí `factory/{job_id}`.
-- `pr_target`: do které větve míří draft PR (výchozí `base_branch`).
-- `mode`:
-  - **`branch-per-job`** (výchozí): každý job má vlastní větev z `base_branch` a draft PR do `pr_target`. Izolace, snadné zahození, review před sloučením, funguje i s chráněnými větvemi.
-  - **`direct`**: job pracuje přímo na pojmenované větvi (`work_branch` bez šablony, např. `feature/payment`). Nutné `concurrency = 1`, protože git nedovolí tutéž větev ve dvou worktree. Při selhání se vrací na `base_sha` a PR vzniká až z celé větve. Slabší kontrola, použít jen pro dlouhodobou feature větev.
-- Agenti nikdy nepushují. Push větve a PR dělá orchestrátor (kap. 8). Při konfliktu s `base_branch` v okamžiku PR job končí v `NEEDS_HUMAN`.
+- `base_branch`: cílová větev, kterou člověk použije při přípravě work branch. Factory zaznamená
+  použitý `base_sha`; synchronizace a řešení konfliktů jsou samostatné řízené operace.
+- Agenti ani orchestrátor nepushují a nevytvářejí PR. Po review publikuje člověk (DD-20).
+- `branch-per-job`, automatické vytváření větví, paralelní joby a automatické PR jsou odloženy.
 
 **Akceptační kritéria:**
 - Nelegální přechod je odmítnut a zalogován.
 - Obnova po pádu: `status` zobrazí stav a poslední událost.
 - Unit testy state machine (všechny povolené a zakázané přechody).
 
-**Závislosti:** žádné. **Otevřené:** D1, D7.
+**Závislosti:** žádné.
 
 ---
 
@@ -197,7 +205,7 @@ copilot -p "Follow .factory/task.md" -C <worktree> \
 - **Izolace konfigurace `[OPEN]` D13:** do headless session se načítají uživatelské agenty, skills a MCP servery (spike vypsal cizí agenty `impeccable-*`, ~20 událostí `mcp_server_status_changed`). Pro reprodukovatelnost a nižší režii runner používá `--disable-builtin-mcps`, `--no-custom-instructions` a, pokud existuje, přesměrování konfiguračního adresáře (viz `copilot help environment`).
 - **Rozpočet (E1/E2), objem streamu:** v E2 bylo 2 350 událostí `assistant.tool_call_delta` (zápis souborů po částech). Pro runner zvážit `--stream off` `[VERIFY]`.
 - **Rozpočet (E1/E2):** událost `model.call_finished` **nenese spotřebu** (jen `dispatchDurationMs`, `outcome`), takže kredity za běhu ze streamu spočítat nejde. Živě lze hlídat jen **počet `model.call_start`** a wall-clock. Kredity zjišťuje orchestrátor po volání z `usage.json` (`totalNanoAiu / 1e9`). `--max-ai-credits` má minimum 30, což je víc než celá typická session na Haiku (<1 kredit), takže pro levné profily je bezcenný. Skutečným řízením je rozpočet orchestrátoru. Spotřeba téhož typu úkolu kolísá (23,6 vs. 15,5 kreditu), proto rozpočty s rezervou.
-- Agenti nikdy nepushují ani neotevírají PR. Dělá to orchestrátor přes `gh`.
+- Agenti ani orchestrátor nepushují ani neotevírají PR. Publikuje člověk po review.
 - Síť: `--allow-url` jen nutné domény.
 
 **Akceptační kritéria:**
@@ -212,89 +220,136 @@ copilot -p "Follow .factory/task.md" -C <worktree> \
 
 ## Kapitola 3 — Gate
 
-**Účel:** objektivní rozhodnutí, zda je změna přijatelná. Spouští ho orchestrátor, ne agent. Stejný skript běží v CI.
+**Účel:** deterministicky ověřit změnu projektu. Gate spouští orchestrátor, ne agent; Gate sama
+nemění stav jobu ani nespouští review.
 
 **Dvě části:**
-1. `.factory/checks.py` (případně `.ps1`; **ne bash-only**, viz D11) v cílovém projektu s režimy `--fast` (testy feature + lint změněných souborů) a `--full` (lint, unit, build, playwright, …). Výstup: JSON report, exit code ≠ 0 při selhání.
-2. `gate.py` v továrně (kontroly nezávislé na projektu):
-   - **protected paths:** testy a `features.json` beze změny builderem,
-   - **scope manifest:** změněné soubory ⊆ povolené cesty ze specu,
-   - **diff budget:** max souborů a řádků na krok,
-   - **risk recompute:** riziko z reálného diffu, smí jen růst (kap. 7),
-   - volitelně secret scan `[OPEN]`.
+1. `.factory/checks.py` v cílovém projektu poskytuje `--fast` a `--full`. Fast spouští testy
+   vybraného slice a relevantní rychlé kontroly; full spouští úplnou projektovou sadu. Přesné
+   příkazy a test discovery respektují existující projekt.
+2. Factory `gate.py` ověřuje scope, chráněné cesty, integritu schválených Test Author testů,
+   kontrolní report a výsledek projektu.
 
-**Výstup:** `gate-report.json` `{checks[], scope, risk, verdict: PASS|FAIL}`. Chybějící report = FAIL.
+Baseline-red je kontrola připravenosti vstupu Test Authora, ne Gate verdict a ne další Gate režim.
+Gate CLI zachovává `factory job gate JOB_ID --base SHA --mode fast|full [--slice SLICE_ID]`.
 
-**Akceptační kritéria:**
-- Gate lze spustit ručně na libovolném worktree.
-- Úprava chráněného testu builderem ⇒ FAIL (regresní test).
-- Překročení scope ⇒ FAIL.
+**Feature Validation:** existující finální full Gate po všech slices slouží jako Feature/Job
+Validation. Nevzniká druhý Gate engine ani duplicitní běh stejné sady.
 
-**Závislosti:** kap. 1. **Otevřené:** `[OPEN]` D8 — co přesně je v `--fast` pro AS/ST projekty.
+**Report v2:** strojově čitelný report obsahuje `gate_type`, `job_id`, `feature_ids`, volitelné
+`slice_id`, původní `job_base_sha`, schválený `gate_base_sha`, přesný `comparison_base_sha`,
+testovaný `head_sha`, čas a trvání, required checks, AC↔test výsledky, hash vstupů a odkazy na
+logy. `risk` zůstává `DEFERRED` do kapitoly 7.
+
+**Verdict:** overall PASS/FAIL je odvozen pouze z povinných kontrol. Každé chybějící, neplatné,
+neprovedené nebo přeskočené povinné ověření znamená FAIL. WARNING je možné jen u výslovně
+nepovinných kontrol.
+
+**Scope a ochrana:**
+- změny mimo schválený scope nebo chráněné cesty znamenají FAIL;
+- Test Authorův výsledek se ověřuje proti původnímu `job_base_sha`; po G1 je jeho test-only commit
+  `gate_base_sha` a integrita testů se dále ověřuje hashem;
+- `comparison_base_sha` určuje přesný diff kontrolovaný daným Gate pokusem (pro slice typicky
+  commit před tímto slice, pro finální Gate `gate_base_sha`);
+- Gate neprovádí risk recompute, automatické CI úpravy ani skryté rozšiřování scope.
+
+**Akceptační kritéria:** chybějící/neplatný report, změna chráněného Test Author testu, scope
+porušení nebo nesplněná required kontrola vždy blokuje pokračování. Gate zůstává state-neutral.
+
+**Závislosti:** kap. 1–2, 4–6. Risk routing vlastní kap. 7.
 
 ---
 
-## Kapitola 4 — Builder smyčka (jedna feature = jedna session)
+## Kapitola 4 — Builder smyčka (jeden slice = jedna session)
 
-**Účel:** inkrementální implementace podle postupů z Anthropic článků.
+**Účel:** implementovat schválenou feature v malých vertikálních slices.
 
-**Vstupy:** `spec.md`, `features.json` (`passes: false`), zamčené testy, `progress.md`, `git log`.
+**Vstupy:** schválený `spec.md` se stabilními AC ID, M1 ručně registrovaný test manifest nebo
+Test Authorův schválený manifest (M3), příslušný Gate base, schválený slice plan, `progress.md`
+a Git history.
 
-**Postup na feature `[PROPOSED]`:**
-1. Smoke check baseline (`checks.py --fast`) — pokud rudý, job jde do `NEEDS_HUMAN`.
-2. Nová session, profil dle rizika (kap. 7). Zadání: feature + relevantní sekce specu + konec `progress.md` + posledních ~10 commitů + scope manifest.
-3. Pokyny: nejmenší možná změna, žádné refaktory mimo scope, spusť jen testy feature, commit, skonči. Neměň `features.json` ani testy.
-4. Orchestrátor spustí `gate --fast`. PASS ⇒ **orchestrátor** nastaví `passes: true` a dopíše `progress.md`. FAIL ⇒ smyčka L1/L2 (kap. 9).
-5. Další feature.
+**Postup:**
+1. M1 zachovává ručně připravené a registrované vstupy. V Test Author workflow orchestrátor před
+   Builderem vyžaduje G1, úspěšný baseline-red a test-only checkpoint; poté uloží `gate_base_sha`.
+2. Builder dostane novou session pro jeden slice, jeho AC/test mapování, scope, ověřený handoff
+   a relevantní historii.
+3. Builder používá TDD: připraví/doplní vlastní testy podle potřeby, implementuje nejmenší změnu
+   a spustí relevantní testy. Všechny registrované testy zůstávají beze změny; v Test Author
+   workflow jsou navíc chráněny hashem. Nové trvalé testy ukládá do projektové konvence; dočasné
+   diagnostiky se neprezentují jako regresní ochrana.
+4. Builder vytvoří commit před Slice Gate. Gate ověří tento přesný commit; PASS teprve poté
+   orchestrátor zaznamená slice jako ověřený a může pokračovat.
+5. Po všech slices běží jeden finální full Gate. PASS otevře `REVIEW`; FAIL zachová práci a vede
+   do `NEEDS_HUMAN`.
 
-**Subagenti:** povoleni pro read-only průzkum, editace jen hlavní builder `[OPEN]` D2.
+Chapter 4/M1 nemá automatické retry. Builder nikdy nepushuje ani nevytváří PR. Factory nevynucuje
+univerzální test adresář a nemění CI bez lidského schválení.
+
+**Subagenti:** Test Author je samostatná session/profile před Builderem. Builderovy další role nebo
+editující subagenti se tímto rozhodnutím nepovolují; zůstává platný schválený read-only režim.
 
 **Režie session (E3, E6):** každé volání nese ~26–28K tokenů kontextu, převážně vlastní system prompt a definice nástrojů CLI. Při **studené cache** stojí session u Sonnetu ~7 kreditů (28,3K tokenů cache write), u Haiku ~0,35. Při **teplé cache** (TTL ~5 min, `cacheExpiresAt` v `usage.json`; sdílí se i mezi procesy se stejným prefixem) jen ~0,3 u Sonnetu a ~0,15 u Haiku. Pravidla: (1) neměnit prefix (stejný agent, nástroje, MCP konfigurace), (2) pouštět features stejného profilu těsně za sebou, (3) používat `--disable-builtin-mcps --no-custom-instructions` (ušetří ~2,3K tokenů a ~4 s startu).
 
-**Akceptační kritéria:**
-- Na ručně napsaném specu s 3 featurami projde celý job do stavu `GATE` bez zásahu.
-- Přerušení a obnova uprostřed jobu pokračuje od první feature s `passes: false`.
-
-**Závislosti:** kap. 1–3. **Otevřené:** D2, D5.
+**Závislosti:** kap. 1–3, 5–6. Retry policy patří do kap. 9.
 
 ---
 
 ## Kapitola 5 — Specifikace (front office, interaktivně)
 
-**Účel:** z issue/zadání vznikne schválený spec.
+**Účel:** z issue/zadání vznikne schválená specifikace s testovatelnými požadavky.
 
 **Postup `[USER]`:**
 1. Člověk + agent `spec-grill` (grill-with-docs) ve VS Code.
-2. Autonomní `spec-critic` (jiný vendor) vrátí nejasnosti, chybějící akceptační kritéria a rizika. Člověk je vyřeší.
-3. Schválení: `factory job approve-spec` uloží `spec_hash`. Změny po schválení jen přes `factory job amend` (nový hash + událost).
+2. `spec-critic` (jiný vendor) navrhne nejasnosti, chybějící AC a rizika; člověk je vyřeší.
+3. Schválení G0 uloží hash specifikace. Změny po schválení probíhají jen řízeným amendem
+   s novým hashem a událostí.
 
-**Šablona `spec.md` `[PROPOSED]`:**
-Kontext · Cíl · Mimo rozsah · Definice · Chování (číslované, testovatelné) · Rozhraní a schémata · Zdroje informací · Omezení · **Scope manifest** (povolené cesty, max souborů/řádků) · **Riziko** (odhad + zdůvodnění) · Testovací plán · Otevřené otázky (musí být prázdné při schválení) · Designové poznámky (nezávazné).
+**Šablona `spec.md`:** kontext · cíl · mimo rozsah · definice · rozhraní/schémata · zdroje ·
+omezení · scope manifest · riziko a odůvodnění · testovací plán · otevřené otázky · designové
+poznámky. Acceptance Criteria jsou stabilně označené `AC-001`, `AC-002`, … a každé popisuje
+pozorovatelné chování. Každé gating AC musí být automatizovatelně ověřitelné.
 
-**Další výstupy:** `features.json` (id, title, acceptance[], tests[], passes:false) a návrh rizika.
+Nepožadujeme, aby Builderovy testy duplikovaly všechna AC. Test Authorův manifest mapuje
+nezávislé acceptance testy na AC; Builderovy testy doplňují technické a regresní případy.
 
-**Model:** nejsilnější dostupný (Opus 5.5). Autor ≠ critic.
+**Model:** nejsilnější dostupný. Autor ≠ critic.
 
-**Akceptační kritéria:** validátor specu (všechny sekce, žádné otevřené otázky, scope manifest neprázdný, každá feature má alespoň jeden test).
+**Akceptační kritéria:** schválená specifikace nemá otevřené otázky, má netriviální scope a každé
+gating AC má stabilní ID a ověřitelný popis.
 
-**Závislosti:** kap. 1, 2. **Otevřené:** D4 (zdroj zadání), jazyk specu a promptů (D9).
+**Závislosti:** kap. 1–2. Zdroj zadání a jazyk promptů/specifikace zůstávají dle D4/D9.
 
 ---
 
-## Kapitola 6 — Test-author a red check
+## Kapitola 6 — Test Author a baseline-red
 
-**Účel:** zamčené TDD testy psané někým jiným než builder.
+**Účel:** připravit nezávislé trvalé acceptance testy před Builderem.
 
-**Postup `[PROPOSED]`:**
-1. Session `test-author` (jiná rodina než builder) dostane jen schválený spec.
-2. Testy do `tests/factory/<job-id>/`. Hash do `job.json` (`tests_hash`).
-3. **Red check:** testy na baseline musí selhat, a to na aserci nebo chybějící funkci, ne na syntaxi/importu (klasifikace chyby).
-4. Lehký lidský souhlas s testy (G1) `[OPEN]` D3.
-5. Od této chvíle jsou testy chráněné cesty (kap. 3).
+**Postup:**
+1. Samostatná Test Author session/profile načte schválenou specifikaci a zjistí konvence cílového
+   projektu. Jiná modelová rodina je volitelná konfigurace, nikoli pevná podmínka.
+2. Test Author vytvoří testy přímo v existující projektové testovací struktuře. Job artefakty
+   obsahují manifest, hashe, reporty a logy, ne jedinou kopii trvalých testů.
+3. Orchestrátor ověří úplný diff Test Authora: povolené jsou jen schválené testové cesty; jiná
+   změna znamená FAIL a eskalaci. Jde o post-run kontrolu, ne OS sandbox. G1 může schválit jen
+   konkrétní změny testových cest, nikoli obecné obejití protected pravidel.
+4. Orchestrátor spočítá candidate manifest a hashe. Člověk provede G1 revizi přesného diffu testů,
+   jejich cest a AC mapování. Člověk nemusí automatizované testy ručně spouštět.
+5. Baseline-red spustí testy proti původnímu `job_base_sha`. PASS-red znamená očekávanou aserční
+   nebo chybějící-funkčnost chybu; chyba syntaxe, importu, setupu či neplatný report není RED.
+6. Orchestrátor commitne pouze přesně schválené testové cesty, ověří obsah a commit SHA, zaznamená
+   test-only checkpoint jako `gate_base_sha` a teprve potom uvolní Buildera.
 
-**Akceptační kritéria:** test, který prochází na baseline, nebo test selhávající na syntaktické chybě ⇒ job se nevrátí do `TESTS_RED_OK`.
+Test Author testy jsou po checkpointu chráněny hashem. Jejich změna/odstranění vyžaduje nové G1,
+nový hash a opakovaný baseline-red. Builder smí přidávat vlastní trvalé testy do schváleného scope,
+ale nesmí měnit Test Authorovu sadu. Nepovinné manuální kontroly jsou mimo automatický Gate; nelze
+je vykázat jako PASS.
 
-**Závislosti:** kap. 3, 5.
+**Akceptační kritéria:** chybějící G1, neúplné AC mapování, test procházející na baseline,
+syntax/setup failure, změna mimo test scope nebo neshoda hashů zastaví workflow před Builderem.
+
+**Závislosti:** kap. 3 a 5. Workflow respektuje ruční M1 registraci dle DD-23; nenahrazuje ji
+zpětně.
 
 ---
 
@@ -304,60 +359,60 @@ Kontext · Cíl · Mimo rozsah · Definice · Chování (číslované, testovate
 
 **Návrh `[PROPOSED]`:**
 - Úrovně: `low | medium | high`.
-- **Deklarované riziko** ze specu (LLM odhad před existencí kódu).
-- **Efektivní riziko** = max(deklarované, přepočet z diffu). Signály: dotčené cesty (auth, migrace DB, infra, bezpečnostně kritický kód), počet souborů a řádků, nové závislosti, změny testů, secrets-like vzory. Pravidla v `config.json` (globy + váhy).
-- Přepočet smí riziko **jen zvýšit** a při zvýšení se doplní reviewery a testy.
-- Routovací tabulka: risk → builder profil, reviewery, testy (Příloha A).
+- Deklarované riziko ze schválené specifikace; efektivní riziko je maximum deklarovaného a
+  deterministického přepočtu z diffu.
+- Signály: citlivé cesty, rozsah změny, nové závislosti a změny testů. Přepočet smí riziko jen
+  zvýšit.
+- Routovací tabulka určuje profily, reviewery a požadované testy včetně podmínek pro E2E.
+- Dokud Chapter 7 není implementována, Gate report označí risk jako `DEFERRED`; Factory nesmí
+  tvrdit, že E2E nebo jiné risk-required testy byly vybrány či spuštěny routingem. Pokud je nutný
+  test relevantní a výběr není spolehlivý, použije se širší dostupná sada.
 
-**Akceptační kritéria:** unit testy pravidel na ukázkových diffech.
-
-**Závislosti:** kap. 3.
+**Závislosti:** kap. 3–6. Risk recompute zůstává mimo odpovědnost základního Gate (DD-19).
 
 ---
 
-## Kapitola 8 — Review a výstup (draft PR)
+## Kapitola 8 — Review a výstup (publikuje člověk)
 
 **Účel:** nezávislá kontrola podle rizika.
 
 **Návrh `[PROPOSED]`:**
-- Reviewer vidí **spec + diff + gate report**, ne úvahy ani transcript buildera. Čistá session na kolo.
-- Každé kolo vrací JSON verdikt:
-  `{reviewer, model, verdict: APPROVE|CHANGES|BLOCK, findings:[{severity, file, line, claim, evidence, fix}]}`.
-  Nález bez `file:line` a důkazu je zahozen.
-- Skeptický prompt a few-shot kalibrace (laděno podle logů). Jiný vendor sám leniency neřeší.
-- Reviewery: `code`, `security` (high), `tests`, `ui` (playwright screenshoty při UI změně).
-- **Approver je jen advisory:** shrne verdikty a doporučí. Merguje člověk.
-- Orchestrátor pushne `work_branch` na `remote` z `.factory/project.json` a otevře **draft PR** do `pr_target` (`gh pr create --draft --base <pr_target>`): popis ze specu, gate report, verdikty, cena. V režimu `direct` PR nevzniká automaticky.
-- Kontext pro review je největší cenová páka (viz Příloha C): posílat jen spec a diff, ne repo.
+- Reviewer vidí schválenou specifikaci, celý diff od `job_base_sha`, Gate report v2 a potřebné
+  artefakty; ne úvahy ani transcript Buildera. Každé kolo používá čistou session.
+- Reviewer vrací JSON verdict `{reviewer, model, verdict: APPROVE|CHANGES|BLOCK,
+  findings:[{severity,file,line,claim,evidence,fix}]}`. Nález bez konkrétního umístění a důkazu se
+  nepoužije jako blokující finding.
+- Reviewery: `code`, `security` dle rizika, `tests`, `ui` pro relevantní UI změny.
+- Approver je advisory; merge rozhoduje člověk.
+- Builder ani orchestrátor nepushují a nevytvářejí PR. Po review člověk publikuje změnu a vytvoří
+  PR. Factory může následně zaznamenat člověkem dodaný PR/issue odkaz a přejít do `PR_OPEN`.
+- CI workflow a remote publikaci Factory nemění bez samostatného lidského pokynu.
 
-**Akceptační kritéria:** schéma verdiktu validováno, nález bez důkazu zahozen, PR obsahuje cenu a verdikty.
-
-**Závislosti:** kap. 2, 3, 7. **Otevřené:** D10 — druhý reviewer z rodiny Gemini (tier neověřen).
+**Závislosti:** kap. 2–7. Stav a evidence PR jsou součástí tohoto Chapter 8 workflow; automatické
+pushnutí a draft PR orchestrátorem je nahrazeno DD-20.
 
 ---
 
 ## Kapitola 9 — Zpětné smyčky, eskalace, člověk
 
-**Účel:** předvídatelné chování při selhání na každé úrovni `[USER]`.
+**Účel:** předvídatelné zacházení se selháním a lidskou eskalací.
 
-| Úroveň | Spouštěč | Akce | Limit (default) |
+Chapter 4/M1 v současnosti automatické retry nemá: Gate FAIL, chyba Runneru, neplatný report,
+neúspěšný baseline-red nebo nejasná recovery zastaví postup, zachovají práci a vyžádají člověka.
+Následující návrhy retry zůstávají návrhem pro samostatný Chapter 9 kontrakt; nesmějí být
+implementovány jako skrytá smyčka v Chapter 4.
+
+| Úroveň | Spouštěč | Navržená akce | Stav |
 |---|---|---|---|
-| L1 TDD | testy feature selhávají | další pokus buildera s ořezaným logem | 3 pokusy |
-| L2 Gate | lint/build/unit/e2e/scope | zpět builderovi s failing výstupem | 2 kola |
-| L3 Review | verdikt CHANGES | builder opraví, nové kolo review | 2 kola |
-| Eskalace | stejný error hash 2× nebo L1 vyčerpáno | vyšší profil buildera; poté **konzultace** | 1 konzultace/feature |
-| L4 Člověk | limity vyčerpány, BLOCK, `BUDGET_EXHAUSTED` | stav `NEEDS_HUMAN` | — |
+| L1 TDD | automatizované testy feature selhávají | omezený další pokus Buildera | návrh, odložen |
+| L2 Gate | lint/build/unit/e2e/scope | oprava podle failing reportu | návrh, odložen |
+| L3 Review | verdict CHANGES | oprava a nové review kolo | návrh, odložen |
+| Eskalace | opakovaný error nebo limit pokusů | vyšší profil a případná konzultace | návrh, odložen |
+| L4 Člověk | BLOCK, nejednoznačnost nebo vyčerpaný limit/rozpočet | `NEEDS_HUMAN` | fail-closed pravidlo |
 
-**Pravidla `[PROPOSED]`:**
-- Eskalace se spouští deterministicky (error hash, počet pokusů), ne podle toho, že se agent "cítí zaseknutý".
-- **Konzultace** = nejvyšší model dostane balíček selhání (spec, diff, failing výstup, shrnutí pokusů) a vrací jen diagnózu v markdownu. Kód nepíše.
-- Člověk vstupuje do stejné session: `copilot --resume <session-id>` ve worktree nebo ve VS Code. Poté `factory job resume`.
-- **`BUDGET` na feature** (kredity ≥ cap, viz kap. 2) je signál, že feature je příliš velká, ne že má builder zkusit totéž znovu (stojí to stejně). Postup `[PROPOSED]`: uložit rozpracované změny (`git diff` + seznam nových souborů) do `runs/<n>/partial.patch`, worktree vrátit na poslední commit, job do `NEEDS_HUMAN` s návrhem rozdělit feature (spec model) nebo zvýšit rozpočet. Žádný automatický retry se stejným profilem.
-- Rozpočty: `credits_feature` a `credits_job`. Překročení ⇒ `BUDGET_EXHAUSTED`. Vyhodnocuje orchestrátor po každém volání z `usage.json`, živě jen počtem volání modelu a časem (kap. 2).
-
-**Akceptační kritéria:** simulace (fake runner) všech cest včetně vyčerpání rozpočtu uprostřed feature.
-
-**Závislosti:** kap. 2, 4, 8.
+Budoucí retry kontrakt musí odlišit chybu slice Gate od finální Feature/Job Validation, mít
+deterministické limity a nesmí automaticky resetovat ani zahodit worktree. `WARNING` nikdy
+nepřekryje required kontrolu. Konzultace může vracet diagnózu, nikoli kód.
 
 ---
 
@@ -389,9 +444,10 @@ Kontext · Cíl · Mimo rozsah · Definice · Chování (číslované, testovate
 
 ---
 
-## Příloha A — `config.json` (návrh, ilustrativní)
+## Příloha A — `config.json` (ilustrativní)
 
-Přesná ID modelů `[VERIFY]` (`copilot --model` / model picker).
+Přesná ID modelů `[VERIFY]` (`copilot --model` / model picker). Role routing, E2E výběr a retry
+limity jsou pouze návrhy pro Chapter 7/9 a nejsou součástí aktuálního M1 workflow.
 
 ```json
 {
@@ -413,13 +469,14 @@ Přesná ID modelů `[VERIFY]` (`copilot --model` / model picker).
     "medium": {"builder": "build-std",  "reviewers": ["review-med"],               "tests": ["fast", "full"]},
     "high":   {"builder": "build-high", "reviewers": ["review-med", "review-high"], "tests": ["fast", "full", "e2e"]}
   },
-  "loop_limits": {"l1_attempts": 3, "l2_rounds": 2, "l3_rounds": 2, "consults_per_feature": 1},
   "budgets": {"credits_feature": 400, "credits_job": 3000},
-  "diff_budget": {"max_files": 8, "max_lines": 300},
-  "protected_paths": ["tests/factory/**", "jobs/**/features.json"],
   "models_status": {"gemini-3.8-flash": "retiring", "gemini-4-argon": "retiring", "mai-code-1.1-flash": "retiring"}
 }
 ```
+
+Numeric diff budgets are not enforced by the Gate. Test Author integrity is tracked by the approved
+manifest hashes; any additional protected paths are project-specific policy in
+`.factory/protected.txt`.
 
 ---
 
@@ -427,19 +484,13 @@ Přesná ID modelů `[VERIFY]` (`copilot --model` / model picker).
 
 | ID | Otázka | Moje výchozí stanovisko |
 |---|---|---|
-| D1 | Repo továrny: samostatné vs. vendored v projektu | samostatné, projekt má jen `.factory/` |
 | D2 | Smí builder spouštět subagenty s editací? | jen read-only subagenti |
-| D3 | Schvaluje člověk i testy (G1)? | ano, krátce, před buildem |
 | D4 | Zdroj zadání: Jira klíč, markdown, GitHub issue | markdown + volný odkaz na Jira klíč |
-| D14 | Větvení v cílovém repu: větev na job vs. přímo do pojmenované větve | `branch-per-job` s konfigurovatelnou `base_branch`, `work_branch` a `pr_target` v `.factory/project.json`; `direct` jen na výslovné přání |
-| D5 | Model na spec a výchozí builder pro nízké riziko | spec = nejsilnější model; Haiku jen pro low risk s malým scope |
-| D7 | Souběžnost | 1, dokud neběží dashboard |
 | D8 | Obsah `--fast` pro projekty s ST/C v Automation Studiu | doplnit po M1 |
 | D9 | Jazyk promptů a specu | prompty anglicky, dokumentace česky |
 | D10 | Druhý reviewer z rodiny Gemini | až po ověření tieru a ceny |
 | D11 | Platforma: Windows nativně vs. WSL / dev container | nativně Windows, vše v Pythonu; `checks.py` místo `checks.sh`; git worktree funguje; WSL/container jen pokud selže E4 nebo sandbox |
 | D12 | Autentizace pro bezobslužný běh (token v prostředí vs. interaktivní login) | interaktivní login pro vývoj; token až pro CI podle policy |
-| D13 | Izolace konfigurace headless session (MCP, skills, uživatelské agenty) | `--disable-builtin-mcps --no-custom-instructions` (E6: −2,3K tokenů, −4 s); přesměrování config adresáře `[VERIFY]` |
 
 ---
 

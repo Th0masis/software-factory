@@ -1,10 +1,12 @@
 # Design Review Outcome: Test Lifecycle and Feature Validation
 
-- **Status:** Design decisions approved by the user on 2026-11-24; not yet implemented.
-- **Purpose:** Record the decisions from the Feature Validation Gate review so the next
-  implementation contract can build on them without silently changing the Chapter 4 M1 contract.
+- **Status:** Design decisions approved by the user on 2026-11-24; canonical design reconciled;
+  follow-on implementation contract drafted for approval; not yet implemented.
+- **Purpose:** Record the decisions from the Feature Validation Gate review and link the concrete
+  follow-on contract without silently changing the Chapter 4 M1 contract.
 - **Related design:** [`design.md`](../../design.md), especially Chapters 3-9.
 - **Decision register:** [`design-deviations.md`](./design-deviations.md), DD-25 through DD-31.
+- **Follow-on contract:** [`chapter-05-06-test-author-validation.md`](./chapter-05-06-test-author-validation.md).
 
 ## 1. Review conclusion
 
@@ -159,14 +161,15 @@ The Factory test suite should prioritize observable deterministic guarantees:
 Acceptance tests should assert user-visible behavior. Builder tests should add technical and edge
 case coverage; the Factory should not require redundant duplicate tests for every AC.
 
-## 5. Known documentation and implementation mismatches
+## 5. Remaining implementation mismatches
 
-1. [`chapter-04.md`](./chapter-04.md) documents a `baseline` Gate CLI mode, but the current CLI
-   accepts only `fast|full`; baseline-red is part of test registration. Align the contract and CLI
-   when the Gate API is next changed.
-2. DD-20 in [`design-deviations.md`](./design-deviations.md) assigns publishing to a human, while
-   Chapter 8 of [`design.md`](../../design.md) still describes orchestrator push and draft PR
-   creation. Update Chapter 8 to match DD-20 before implementing publication/review workflow.
+1. The approved Chapter 3/4 contracts specify a `baseline` Gate CLI mode, but the current CLI
+   accepts only `fast|full`; baseline-red is part of test registration. Both contracts now record
+   this mismatch. The follow-on contract does not silently expand the CLI; reconcile the baseline
+   Gate mode separately before relying on it.
+2. The canonical design now assigns publishing to a human, as required by DD-20. Chapter 3/4
+   contracts retain their approved M1 wording and now explicitly note the CLI mismatch; the
+   Test Author contract does not silently expand that CLI.
 3. The current report schema is v1 and does not contain AC outcomes, the Test Author checkpoint, or
    the three SHA roles above.
 4. The current Chapter 4 contract is complete for M1 and remains the source of truth for that
@@ -175,16 +178,17 @@ case coverage; the Factory should not require redundant duplicate tests for ever
 
 ## 6. Recommended implementation order
 
-1. **Reconcile canonical design and contracts.** Correct Chapter 8's publishing contradiction,
-   settle the Gate CLI baseline wording, and create the follow-on Chapter 5/6/3 implementation
-   contract without rewriting the completed M1 contract.
-2. **Define schemas and trust boundaries.** Specify stable AC IDs, ownership of test IDs, the
-   Test Author-only scope, G1 evidence, baseline-red result, test checkpoint event, and all three
-   SHA meanings.
+1. **Approve the follow-on contract.** Review
+   [`chapter-05-06-test-author-validation.md`](./chapter-05-06-test-author-validation.md), especially
+   its workflow-selection, AC format, manifest v2, G1, checkpoint, and report v2 details. Reconcile
+   the separately documented M1 baseline Gate-mode mismatch before implementing that mode.
+2. **Define schemas and trust boundaries.** The draft contract specifies stable AC IDs, test
+   ownership, Test Author scope, G1 evidence, baseline-red result, checkpoint event, and SHA roles.
 3. **Implement Test Author preparation.** Run it in a separate session/profile; enforce test-only
    scope after execution; validate baseline-red; require G1; create and journal the test checkpoint.
-4. **Implement Gate report v2 and baseline support.** Use the approved test checkpoint for slice
-   and final checks while retaining the original base for audit and review.
+4. **Implement Gate report v2.** Use the approved test checkpoint for slice and final checks while
+   retaining the original base for audit and review. Resolve the M1 baseline-mode mismatch
+   separately; this contract does not add that CLI mode.
 5. **Extend Builder test handling.** Permit Builder-owned persistent tests without allowing
    mutation of the approved Test Author set; verify discovery and execution.
 6. **Add project test/CI detection.** Recommend project-specific setup and require human approval
@@ -195,6 +199,5 @@ case coverage; the Factory should not require redundant duplicate tests for ever
 
 ## 7. Non-goals of this record
 
-This record does not implement Test Author, change the M1 state machine, introduce retries, add
-risk routing, create CI workflows, or authorize push/PR automation. Those changes require their
-own implementation contracts and validation.
+This record and the follow-on contract do not implement Test Author, change the M1 state machine,
+introduce retries, add risk routing, create CI workflows, or authorize push/PR automation.

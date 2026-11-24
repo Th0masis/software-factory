@@ -10,6 +10,12 @@
 This contract translates the Chapter 4 review into a testable execution contract. It does not amend
 `design.md`. Implementation starts only after this contract is explicitly approved.
 
+> **Implementation status clarification — 2026-11-24:** This approved contract specifies
+> `factory job gate --mode baseline|fast|full`, but the current CLI accepts only `fast|full` with an
+> optional slice ID. Baseline-red is separately implemented by test registration through
+> `.factory/checks.py --red`. The Test Author/Feature Validation contract does not add a `baseline`
+> Gate mode; the mismatch must be resolved separately before the mode is relied on.
+
 ## 1. Scope
 
 ### Goals

@@ -9,6 +9,7 @@ Další dokumentaci soustřeď do této složky.
 - [Implementační kontrakt — Kapitola 2](./implementation/chapter-02.md)
 - [Implementační kontrakt — Kapitola 3](./implementation/chapter-03.md)
 - [Implementační kontrakt — Kapitola 4](./implementation/chapter-04.md)
+- [Návrh implementačního kontraktu — Test Author a Feature Validation](./implementation/chapter-05-06-test-author-validation.md)
 - [Závěr review — životní cyklus testů a Feature Validation](./implementation/test-lifecycle-and-feature-validation.md)
 - [Průběh — Kapitola 3](./implementation/chapter-03-progress.md)
 - [Průběh — Kapitola 1](./implementation/chapter-01-progress.md)
