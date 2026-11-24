@@ -11,8 +11,10 @@ from .job import (
     FactoryError,
     attach_worktree,
     create_job,
+    initialize_job,
     list_jobs,
     register_spec,
+    register_slice_plan,
     register_tests,
     read_job,
     release_worktree,
@@ -32,9 +34,13 @@ def _parser():
     new.add_argument("--title", required=True)
     prepare = job_commands.add_parser("prepare")
     prepare.add_argument("job_id")
-    prepare.add_argument("--stage", choices=("spec", "tests"), required=True)
+    prepare.add_argument("--stage", choices=("spec", "tests", "plan"), required=True)
     prepare.add_argument("--path", required=True, type=Path)
+    prepare.add_argument("--init-script", type=Path)
     prepare.add_argument("--approve", action="store_true")
+    initialize = job_commands.add_parser("initialize")
+    initialize.add_argument("job_id")
+    initialize.add_argument("--profile", required=True)
     status = job_commands.add_parser("status")
     status.add_argument("job_id")
     transition = job_commands.add_parser("transition")
@@ -73,10 +79,20 @@ def main(argv=None):
                 result = register_spec(
                     Path.cwd(), args.job_id, args.path, args.approve
                 )
-            else:
+            elif args.stage == "tests":
                 result = register_tests(
                     Path.cwd(), args.job_id, args.path, args.approve
                 )
+            else:
+                result = register_slice_plan(
+                    Path.cwd(),
+                    args.job_id,
+                    args.path,
+                    args.init_script,
+                    args.approve,
+                )
+        elif args.job_command == "initialize":
+            result = initialize_job(Path.cwd(), args.job_id, args.profile)
         elif args.job_command == "status":
             result = read_job(Path.cwd(), args.job_id)
         elif args.job_command == "transition":

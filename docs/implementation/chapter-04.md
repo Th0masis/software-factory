@@ -239,6 +239,11 @@ validation, every registered test ID must map to exactly one slice before the pl
 feature is complete only when all its slices pass. A job is complete only when all planned features
 pass.
 
+The plan uses schema version 1: `features` is an ordered array of `{id, title, slices}` objects;
+each slice is `{id, goal, paths, acceptance, test_ids}`. Slice paths are exact repository-relative
+paths, not globs, and must match the approved scope. Feature and slice IDs are unique, acceptance
+criteria and path lists are non-empty, and the test-ID mapping is complete and duplicate-free.
+
 The initializer may propose a plan but cannot approve it, alter the spec/tests, or mark any
 acceptance criterion passed. The orchestrator validates the plan against the approved spec and
 scope, records its hash, and requires explicit human approval before starting a builder session.
@@ -304,6 +309,10 @@ transitions. The final Gate must pass before `GATE -> REVIEW`.
 
 - The initializer is a distinct first session with a specialized task; later sessions are coding
   sessions. It may propose only the approved plan and `.factory/init.py`.
+- Its final `assistant.message` must be one JSON object with exactly `plan` and `init_script`.
+  The orchestrator extracts that object from Runner JSONL output and stores attempt-scoped pending
+  artifacts under the job directory; the initializer does not write proposal files into the target
+  worktree.
 - A human reviews and approves the script before any invocation. Its approved hash and exact path
   are recorded. The orchestrator rejects a missing, changed, symlinked, or out-of-scope script.
 - Run the script with the configured Python executable, argument-array invocation, `shell=False`,

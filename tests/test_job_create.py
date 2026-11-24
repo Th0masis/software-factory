@@ -1,14 +1,19 @@
 import hashlib
+import io
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from unittest.mock import patch
 
 from factory import job as job_service
+from factory.cli import main as cli_main
+from factory.runner import RunResult
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -239,6 +244,520 @@ class JobCreateCliTests(unittest.TestCase):
             encoding="utf-8",
         )
         return factory_root, target_repo, env, job_id, manifest_path
+
+    def _prepare_initializer_job(self, temp_root):
+        factory_root, target_repo, env, job_id, manifest_path = (
+            self._prepare_baseline_red_job(temp_root)
+        )
+        registered = self._run_cli(
+            factory_root,
+            env,
+            "job",
+            "prepare",
+            job_id,
+            "--stage",
+            "tests",
+            "--path",
+            str(manifest_path),
+            "--approve",
+        )
+        self.assertEqual(registered.returncode, 0, registered.stderr)
+        config_path = factory_root / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["profiles"] = {
+            "initializer-test": {
+                "agent": "builder",
+                "model": "test-model",
+                "effort": "low",
+                "context": "default",
+                "max_ai_credits": 10,
+            }
+        }
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        job_dir = factory_root / "jobs" / job_id
+        (job_dir / "scope.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "allowed_paths": [".factory/init.py", "tests/**"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        plan = {
+            "schema_version": 1,
+            "features": [
+                {
+                    "id": "widget-acceptance",
+                    "title": "Widget acceptance",
+                    "slices": [
+                        {
+                            "id": "widget-acceptance-test",
+                            "goal": "Satisfy the widget acceptance test",
+                            "paths": ["tests/test_widget.py"],
+                            "acceptance": ["The acceptance test passes"],
+                            "test_ids": ["tests.test_widget.test_acceptance"],
+                        }
+                    ],
+                }
+            ],
+        }
+        init_script = "from pathlib import Path\nprint(Path.cwd())\n"
+        run_dir = job_dir / "runs" / "1"
+        run_dir.mkdir(parents=True)
+        stdout_path = run_dir / "stdout.jsonl"
+        stdout_path.write_text(
+            json.dumps(
+                {
+                    "type": "assistant.message",
+                    "content": json.dumps(
+                        {"plan": plan, "init_script": init_script}
+                    ),
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        session_path = run_dir / "session.md"
+        session_path.write_text("Initializer session\n", encoding="utf-8")
+        runner_result = RunResult(
+            outcome="OK",
+            exit_code=0,
+            usage=None,
+            session_id="fake-session",
+            paths={
+                "run_dir": run_dir,
+                "stdout": stdout_path,
+                "session": session_path,
+            },
+            error=None,
+        )
+        return factory_root, target_repo, env, job_id, plan, init_script, runner_result
+
+    def _run_initializer(self, factory_root, job_id, runner_result, side_effect=None):
+        output = io.StringIO()
+        if side_effect is None:
+            def return_result(role, profile, task_file, cwd, session_name):
+                self.assertEqual(role, "builder")
+                return runner_result
+
+            side_effect = return_result
+        runner_patch = (
+            patch("factory.runner.run_agent", side_effect=side_effect)
+        )
+        with patch("factory.cli.Path.cwd", return_value=factory_root):
+            with runner_patch:
+                with redirect_stdout(output):
+                    exit_code = cli_main(
+                        ["job", "initialize", job_id, "--profile", "initializer-test"]
+                    )
+        return exit_code, output.getvalue()
+
+    def test_initialize_persists_pending_plan_and_script_from_runner_jsonl(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (
+                factory_root,
+                _target_repo,
+                _env,
+                job_id,
+                plan,
+                init_script,
+                runner_result,
+            ) = self._prepare_initializer_job(Path(temp_dir))
+            job_dir = factory_root / "jobs" / job_id
+            exit_code, output = self._run_initializer(
+                factory_root, job_id, runner_result
+            )
+
+            self.assertEqual(exit_code, 0)
+            result = json.loads(output)
+            self.assertEqual(result["job"]["state"], "TESTS_RED_OK")
+            self.assertEqual(
+                json.loads(
+                    (job_dir / result["last_event"]["plan_path"]).read_text(
+                        encoding="utf-8"
+                    )
+                ),
+                plan,
+            )
+            self.assertEqual(
+                (job_dir / result["last_event"]["init_script_path"]).read_text(
+                    encoding="utf-8"
+                ),
+                init_script,
+            )
+            self.assertEqual(result["last_event"]["type"], "INITIALIZER_RUN_COMPLETED")
+            self.assertEqual(result["last_event"]["outcome"], "OK")
+            worktree = Path(
+                job_service.read_job(factory_root, job_id)["job"]["worktree_path"]
+            )
+            self.assertFalse((worktree / ".factory" / "task.md").exists())
+            script_path = job_dir / result["last_event"]["init_script_path"]
+            script_path.write_text("changed\n", encoding="utf-8")
+            with self.assertRaisesRegex(
+                job_service.ConfigurationError, "initializer artifact hash mismatch"
+            ):
+                job_service.read_job(factory_root, job_id)
+
+    def test_initializer_malformed_json_escalates_to_human(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            factory_root, _, _, job_id, _, _, runner_result = (
+                self._prepare_initializer_job(Path(temp_dir))
+            )
+            runner_result.paths["stdout"].write_text(
+                '{"type":"assistant.message","content":"not JSON"}\n',
+                encoding="utf-8",
+            )
+
+            exit_code, _ = self._run_initializer(
+                factory_root, job_id, runner_result
+            )
+
+            self.assertEqual(exit_code, 1)
+            status = job_service.read_job(factory_root, job_id)
+            self.assertEqual(status["job"]["state"], "NEEDS_HUMAN")
+            self.assertEqual(
+                status["last_event"]["failure_outcome"], "ERROR"
+            )
+            self.assertIn("one JSON object", status["last_event"]["failure_reason"])
+
+    def test_initializer_worktree_changes_are_preserved_and_escalated(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            factory_root, _, _, job_id, _, _, runner_result = (
+                self._prepare_initializer_job(Path(temp_dir))
+            )
+            worktree = Path(
+                job_service.read_job(factory_root, job_id)["job"]["worktree_path"]
+            )
+
+            def change_target(role, profile, task_file, cwd, session_name):
+                (cwd / "initializer-change.txt").write_text(
+                    "preserve\n", encoding="utf-8"
+                )
+                return runner_result
+
+            exit_code, _ = self._run_initializer(
+                factory_root, job_id, runner_result, side_effect=change_target
+            )
+
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(
+                (worktree / "initializer-change.txt").read_text(encoding="utf-8"),
+                "preserve\n",
+            )
+            status = job_service.read_job(factory_root, job_id)
+            self.assertEqual(status["job"]["state"], "NEEDS_HUMAN")
+            self.assertIn("changed the target worktree", status["last_event"]["failure_reason"])
+
+    def test_initializer_timeout_escalates_with_durable_diagnostics(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            factory_root, _, _, job_id, _, _, runner_result = (
+                self._prepare_initializer_job(Path(temp_dir))
+            )
+            failed_result = replace(
+                runner_result,
+                outcome="TIMEOUT",
+                exit_code=None,
+                error="Copilot session timed out",
+            )
+
+            exit_code, output = self._run_initializer(
+                factory_root, job_id, failed_result
+            )
+
+            self.assertEqual(exit_code, 1)
+            status = job_service.read_job(factory_root, job_id)
+            self.assertEqual(status["job"]["state"], "NEEDS_HUMAN")
+            self.assertEqual(
+                status["last_event"]["failure_stage"], "initializer"
+            )
+            self.assertEqual(status["last_event"]["failure_outcome"], "TIMEOUT")
+            self.assertIn("runs/1", status["last_event"]["run_dir"])
+
+    def test_initializer_invalid_success_run_directory_escalates_to_human(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            factory_root, _, _, job_id, _, _, runner_result = (
+                self._prepare_initializer_job(Path(temp_dir))
+            )
+            runner_result.paths["run_dir"] = Path(temp_dir) / "outside-run"
+
+            exit_code, _ = self._run_initializer(
+                factory_root, job_id, runner_result
+            )
+
+            self.assertEqual(exit_code, 1)
+            status = job_service.read_job(factory_root, job_id)
+            self.assertEqual(status["job"]["state"], "NEEDS_HUMAN")
+            self.assertEqual(status["last_event"]["failure_stage"], "initializer")
+            self.assertIn(
+                "initializer run artifacts are outside the job",
+                status["last_event"]["failure_reason"],
+            )
+
+    def test_initializer_retry_requires_resume_and_uses_a_new_attempt(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            factory_root, _, env, job_id, _, _, runner_result = (
+                self._prepare_initializer_job(Path(temp_dir))
+            )
+            failed_result = replace(
+                runner_result,
+                outcome="TIMEOUT",
+                exit_code=None,
+                error="Copilot session timed out",
+            )
+            failed, _ = self._run_initializer(factory_root, job_id, failed_result)
+            self.assertEqual(failed, 1)
+            failed_status = job_service.read_job(factory_root, job_id)
+            self.assertEqual(failed_status["job"]["state"], "NEEDS_HUMAN")
+            failed_attempt_id = failed_status["last_event"]["attempt_id"]
+            without_resume, _ = self._run_initializer(
+                factory_root, job_id, runner_result
+            )
+            self.assertEqual(without_resume, 2)
+            resumed = self._run_cli(
+                factory_root,
+                env,
+                "job",
+                "resume",
+                job_id,
+                "--reason",
+                "Human approved another initializer attempt",
+            )
+            self.assertEqual(resumed.returncode, 0, resumed.stderr)
+
+            second_run = factory_root / "jobs" / job_id / "runs" / "2"
+            second_run.mkdir()
+            second_stdout = second_run / "stdout.jsonl"
+            first_stdout = runner_result.paths["stdout"].read_text(encoding="utf-8")
+            second_stdout.write_text(first_stdout, encoding="utf-8")
+            second_session = second_run / "session.md"
+            second_session.write_text("Initializer retry\n", encoding="utf-8")
+            retry_result = replace(
+                runner_result,
+                paths={
+                    "run_dir": second_run,
+                    "stdout": second_stdout,
+                    "session": second_session,
+                },
+            )
+            retried, output = self._run_initializer(
+                factory_root, job_id, retry_result
+            )
+
+            self.assertEqual(retried, 0, output)
+            retried_event = json.loads(output)["last_event"]
+            self.assertNotEqual(retried_event["attempt_id"], failed_attempt_id)
+            self.assertEqual(
+                job_service.read_job(factory_root, job_id)["job"]["state"],
+                "TESTS_RED_OK",
+            )
+
+    def test_prepare_plan_rejects_unmapped_registered_test(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            factory_root, _, env, job_id, _, _, runner_result = (
+                self._prepare_initializer_job(Path(temp_dir))
+            )
+            initialized, output = self._run_initializer(
+                factory_root, job_id, runner_result
+            )
+            self.assertEqual(initialized, 0, output)
+            init_event = json.loads(output)["last_event"]
+            job_dir = factory_root / "jobs" / job_id
+            plan = json.loads(
+                (job_dir / init_event["plan_path"]).read_text(encoding="utf-8")
+            )
+            plan["features"][0]["slices"][0]["test_ids"] = ["unknown.test.id"]
+            plan_path = Path(temp_dir) / "incomplete-plan.json"
+            plan_path.write_text(json.dumps(plan), encoding="utf-8")
+
+            prepared = self._run_cli(
+                factory_root,
+                env,
+                "job",
+                "prepare",
+                job_id,
+                "--stage",
+                "plan",
+                "--path",
+                str(plan_path),
+                "--init-script",
+                str(job_dir / init_event["init_script_path"]),
+                "--approve",
+            )
+
+            self.assertEqual(prepared.returncode, 2)
+            self.assertIn("every registered test ID must appear exactly once", prepared.stderr)
+            self.assertEqual(job_service.read_job(factory_root, job_id)["job"]["state"], "TESTS_RED_OK")
+            worktree = Path(
+                job_service.read_job(factory_root, job_id)["job"]["worktree_path"]
+            )
+            self.assertFalse((worktree / ".factory" / "init.py").exists())
+
+    def test_prepare_plan_rejects_paths_outside_approved_scope(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            factory_root, _, env, job_id, _, _, runner_result = (
+                self._prepare_initializer_job(Path(temp_dir))
+            )
+            initialized, output = self._run_initializer(
+                factory_root, job_id, runner_result
+            )
+            self.assertEqual(initialized, 0, output)
+            job_dir = factory_root / "jobs" / job_id
+            init_event = json.loads(output)["last_event"]
+            plan = json.loads(
+                (job_dir / init_event["plan_path"]).read_text(encoding="utf-8")
+            )
+            plan["features"][0]["slices"][0]["paths"] = ["outside/module.py"]
+            plan_path = Path(temp_dir) / "out-of-scope-plan.json"
+            plan_path.write_text(json.dumps(plan), encoding="utf-8")
+
+            prepared = self._run_cli(
+                factory_root,
+                env,
+                "job",
+                "prepare",
+                job_id,
+                "--stage",
+                "plan",
+                "--path",
+                str(plan_path),
+                "--init-script",
+                str(job_dir / init_event["init_script_path"]),
+                "--approve",
+            )
+
+            self.assertEqual(prepared.returncode, 2)
+            self.assertIn("outside approved scope", prepared.stderr)
+            self.assertEqual(
+                job_service.read_job(factory_root, job_id)["job"]["state"],
+                "TESTS_RED_OK",
+            )
+
+    def test_prepare_plan_requires_initializer_script_in_approved_scope(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            factory_root, _, env, job_id, _, _, runner_result = (
+                self._prepare_initializer_job(Path(temp_dir))
+            )
+            (factory_root / "jobs" / job_id / "scope.json").write_text(
+                json.dumps({"schema_version": 1, "allowed_paths": ["tests/**"]}),
+                encoding="utf-8",
+            )
+            initialized, output = self._run_initializer(
+                factory_root, job_id, runner_result
+            )
+            self.assertEqual(initialized, 0, output)
+            init_event = json.loads(output)["last_event"]
+            job_dir = factory_root / "jobs" / job_id
+
+            prepared = self._run_cli(
+                factory_root,
+                env,
+                "job",
+                "prepare",
+                job_id,
+                "--stage",
+                "plan",
+                "--path",
+                str(job_dir / init_event["plan_path"]),
+                "--init-script",
+                str(job_dir / init_event["init_script_path"]),
+                "--approve",
+            )
+
+            self.assertEqual(prepared.returncode, 2)
+            self.assertIn("initializer script path is outside approved scope", prepared.stderr)
+            self.assertEqual(
+                job_service.read_job(factory_root, job_id)["job"]["state"],
+                "TESTS_RED_OK",
+            )
+
+    def test_prepare_approved_plan_commits_only_the_initializer_script(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (
+                factory_root,
+                _target_repo,
+                env,
+                job_id,
+                _plan,
+                init_script,
+                runner_result,
+            ) = self._prepare_initializer_job(Path(temp_dir))
+            initialized, output = self._run_initializer(
+                factory_root, job_id, runner_result
+            )
+            self.assertEqual(initialized, 0, output)
+            init_event = json.loads(output)["last_event"]
+            job_dir = factory_root / "jobs" / job_id
+            plan_args = [
+                "job",
+                "prepare",
+                job_id,
+                "--stage",
+                "plan",
+                "--path",
+                str(job_dir / init_event["plan_path"]),
+                "--init-script",
+                str(job_dir / init_event["init_script_path"]),
+            ]
+            unapproved = self._run_cli(factory_root, env, *plan_args)
+            self.assertEqual(unapproved.returncode, 2)
+            self.assertEqual(
+                job_service.read_job(factory_root, job_id)["job"]["state"],
+                "TESTS_RED_OK",
+            )
+            self.assertFalse(
+                (Path(job_service.read_job(factory_root, job_id)["job"]["worktree_path"])
+                 / ".factory" / "init.py").exists()
+            )
+            prepared = self._run_cli(factory_root, env, *plan_args, "--approve")
+
+            self.assertEqual(prepared.returncode, 0, prepared.stderr)
+            result = json.loads(prepared.stdout)
+            self.assertEqual(result["job"]["state"], "BUILDING")
+            worktree = Path(result["job"]["worktree_path"])
+            self.assertEqual(
+                job_service.read_job(factory_root, job_id)["job"]["state"],
+                "BUILDING",
+            )
+            self.assertEqual(
+                result["last_event"]["init_script_target"], ".factory/init.py"
+            )
+            self.assertEqual(
+                result["last_event"]["plan_sha256"],
+                hashlib.sha256((job_dir / "slice-plan.json").read_bytes()).hexdigest(),
+            )
+            self.assertEqual(
+                result["last_event"]["init_script_sha256"],
+                hashlib.sha256(init_script.encode("utf-8")).hexdigest(),
+            )
+            self.assertEqual(
+                (job_dir / "init.py").read_text(encoding="utf-8"), init_script
+            )
+            changed_paths = subprocess.run(
+                [
+                    "git",
+                    "diff-tree",
+                    "--no-commit-id",
+                    "--name-only",
+                    "-r",
+                    "HEAD",
+                ],
+                cwd=worktree,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.splitlines()
+            self.assertEqual(changed_paths, [".factory/init.py"])
+            self.assertEqual(
+                subprocess.run(
+                    ["git", "status", "--porcelain"],
+                    cwd=worktree,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout,
+                "",
+            )
 
     def test_new_creates_metadata_without_branch_or_worktree(self):
         with tempfile.TemporaryDirectory() as temp_dir:

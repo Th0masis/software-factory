@@ -570,6 +570,71 @@ def _validate_red_report(job_dir, job, event):
         raise ConfigurationError("baseline-red report does not match registered tests")
 
 
+def _validate_initializer_attempt(job_dir, event):
+    attempt_id = event.get("attempt_id")
+    if (
+        not isinstance(attempt_id, str)
+        or re.fullmatch(r"[0-9a-f]{32}", attempt_id) is None
+        or not isinstance(event.get("profile"), str)
+        or not event["profile"].strip()
+        or not isinstance(event.get("scope_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", event["scope_sha256"]) is None
+        or not isinstance(event.get("task_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", event["task_sha256"]) is None
+    ):
+        raise ConfigurationError("invalid initializer attempt ID")
+    attempt_dir = job_dir / "initializer" / f"attempt-{attempt_id}"
+    if (
+        (job_dir / "initializer").is_symlink()
+        or attempt_dir.is_symlink()
+        or not attempt_dir.is_dir()
+    ):
+        raise ConfigurationError("initializer attempt artifacts are missing or invalid")
+    scope_path = job_dir / "scope.json"
+    if scope_path.is_symlink() or not scope_path.is_file():
+        raise ConfigurationError("initializer scope is missing or invalid")
+    try:
+        scope_hash = hashlib.sha256(scope_path.read_bytes()).hexdigest()
+    except OSError as error:
+        raise ConfigurationError(f"cannot read initializer scope: {error}") from error
+    if scope_hash != event.get("scope_sha256"):
+        raise ConfigurationError("initializer scope hash mismatch")
+    task_path = attempt_dir / "task.md"
+    if task_path.is_symlink() or not task_path.is_file():
+        raise ConfigurationError("initializer task snapshot is missing or invalid")
+    try:
+        task_hash = hashlib.sha256(task_path.read_bytes()).hexdigest()
+    except OSError as error:
+        raise ConfigurationError(f"cannot read initializer task snapshot: {error}") from error
+    if task_hash != event["task_sha256"]:
+        raise ConfigurationError("initializer task snapshot hash mismatch")
+
+
+def _validate_initializer_artifacts(job_dir, event):
+    _validate_initializer_attempt(job_dir, event)
+    attempt_id = event["attempt_id"]
+
+    artifact_fields = {
+        "plan_path": f"initializer/attempt-{attempt_id}/slice-plan.json",
+        "init_script_path": f"initializer/attempt-{attempt_id}/init.py",
+    }
+    for path_field, expected_path in artifact_fields.items():
+        if event.get(path_field) != expected_path:
+            raise ConfigurationError("invalid initializer artifact path")
+        digest = event.get(path_field.replace("_path", "_sha256"))
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise ConfigurationError("invalid initializer artifact hash")
+        artifact = job_dir / expected_path
+        if artifact.is_symlink() or not artifact.is_file():
+            raise ConfigurationError("initializer artifact is missing or invalid")
+        try:
+            actual_digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+        except OSError as error:
+            raise ConfigurationError(f"cannot read initializer artifact: {error}") from error
+        if actual_digest != digest:
+            raise ConfigurationError("initializer artifact hash mismatch")
+
+
 def _read_event_log(path, job_id):
     try:
         contents = path.read_text(encoding="utf-8")
@@ -687,12 +752,45 @@ def _read_event_log(path, job_id):
                     and job.state == "TESTS_WRITTEN"
                     and event_job.state == "TESTS_RED_OK"
                 )
+                is_plan_approved = (
+                    event["type"] == "JOB_STATE_CHANGED"
+                    and job.state == "TESTS_RED_OK"
+                    and event_job.state == "BUILDING"
+                )
+                is_initializer_failure = (
+                    event["type"] == "JOB_STATE_CHANGED"
+                    and job.state == "TESTS_RED_OK"
+                    and event_job.state == "NEEDS_HUMAN"
+                    and event.get("failure_stage") == "initializer"
+                )
                 has_input_metadata = any(
                     key in event for key in ("input_path", "input_sha256")
                 )
                 has_red_metadata = any(
                     key in event
                     for key in ("red_report_path", "red_report_sha256")
+                )
+                has_plan_metadata = any(
+                    key in event
+                    for key in (
+                        "plan_path",
+                        "plan_sha256",
+                        "init_script_path",
+                        "init_script_target",
+                        "init_script_sha256",
+                        "setup_commit",
+                    )
+                )
+                has_initializer_failure = any(
+                    key in event
+                    for key in (
+                        "failure_stage",
+                        "attempt_id",
+                        "failure_outcome",
+                        "failure_reason",
+                        "run_dir",
+                        "session_id",
+                    )
                 )
                 if is_spec_approval:
                     input_path = event.get("input_path")
@@ -742,10 +840,78 @@ def _read_event_log(path, job_id):
                             f"invalid baseline-red event metadata for job {job_id}"
                         )
                     _validate_red_report(path.parent, event_job, event)
-                elif has_input_metadata or has_red_metadata:
+                elif is_plan_approved:
+                    if (
+                        has_input_metadata
+                        or has_red_metadata
+                        or not has_plan_metadata
+                    ):
+                        raise ConfigurationError(
+                            f"invalid slice plan metadata for job {job_id}"
+                        )
+                    _validate_approved_plan_artifacts(path.parent, event)
+                elif is_initializer_failure:
+                    if (
+                        has_input_metadata
+                        or has_red_metadata
+                        or has_plan_metadata
+                        or not has_initializer_failure
+                    ):
+                        raise ConfigurationError(
+                            f"invalid initializer failure event for job {job_id}"
+                        )
+                    _validate_initializer_failure_event(
+                        path.parent, event, events[-1]
+                    )
+                elif (
+                    has_input_metadata
+                    or has_red_metadata
+                    or has_plan_metadata
+                    or has_initializer_failure
+                ):
                     raise ConfigurationError(
                         f"unexpected registered input metadata for job {job_id}"
                     )
+            elif event["type"] == "INITIALIZER_RUN_STARTED":
+                if (
+                    job.state != "TESTS_RED_OK"
+                    or event_job != job
+                    or events[-1]["type"]
+                    in {"INITIALIZER_RUN_STARTED", "INITIALIZER_RUN_COMPLETED"}
+                ):
+                    raise ConfigurationError(
+                        f"invalid initializer start event for job {job_id}"
+                    )
+                _validate_initializer_attempt(path.parent, event)
+            elif event["type"] == "INITIALIZER_RUN_COMPLETED":
+                if (
+                    job.state != "TESTS_RED_OK"
+                    or event_job != job
+                    or event.get("outcome") != "OK"
+                    or events[-1]["type"] != "INITIALIZER_RUN_STARTED"
+                    or events[-1].get("attempt_id") != event.get("attempt_id")
+                    or events[-1].get("profile") != event.get("profile")
+                    or events[-1].get("scope_sha256") != event.get("scope_sha256")
+                    or events[-1].get("task_sha256") != event.get("task_sha256")
+                    or not isinstance(event.get("run_dir"), str)
+                    or not re.fullmatch(r"runs/[1-9][0-9]*", event["run_dir"])
+                    or (
+                        event.get("session_id") is not None
+                        and (
+                            not isinstance(event["session_id"], str)
+                            or not event["session_id"].strip()
+                        )
+                    )
+                ):
+                    raise ConfigurationError(
+                        f"invalid initializer run event for job {job_id}"
+                    )
+                diagnostic_dir = path.parent / event["run_dir"]
+                if diagnostic_dir.is_symlink() or not diagnostic_dir.is_dir():
+                    raise ConfigurationError(
+                        f"initializer diagnostics are missing or invalid for job {job_id}"
+                    )
+                _validate_initializer_artifacts(path.parent, event)
             elif event["type"] == "WORKTREE_ATTACH_STARTED":
                 if (
                     job.state != "SPEC_APPROVED"
@@ -1231,6 +1397,696 @@ def register_tests(factory_root, job_id, manifest_path, approved):
             },
         )
         return completed
+
+
+def _initializer_task(spec_content, tests, scope):
+    return (
+        "You are the Software Factory initializer. Do not edit or create files in the "
+        "target worktree. Read the locked specification, registered tests, and source "
+        "files as needed, then return exactly one JSON object in your final assistant "
+        "message with keys `plan` and `init_script`.\n\n"
+        "The plan must use schema_version 1 and this shape: features is a non-empty "
+        "ordered array of objects with id, title, and ordered slices. Each slice has "
+        "id, goal, paths (exact repository-relative paths, not globs), acceptance "
+        "(testable criteria), and test_ids (registered test IDs). Use each registered "
+        "test ID exactly once across all slices. The init_script value must be the "
+        "complete Python source for `.factory/init.py`.\n\n"
+        "Approved specification:\n"
+        f"{spec_content.decode('utf-8')}\n\n"
+        "Locked test manifest:\n"
+        f"{json.dumps(tests, indent=2, sort_keys=True)}\n\n"
+        "Approved scope patterns:\n"
+        f"{json.dumps(scope, indent=2)}\n"
+    )
+
+
+def _parse_initializer_response(stdout_path):
+    from .gate import _reject_json_constant
+
+    from .runner import _read_jsonl
+
+    records, errors = _read_jsonl(stdout_path)
+    if errors:
+        raise ConfigurationError(
+            "initializer output is invalid: " + "; ".join(errors)
+        )
+    messages = [
+        record.get("content")
+        for record in records
+        if record.get("type") == "assistant.message"
+    ]
+    if not messages or not isinstance(messages[-1], str):
+        raise ConfigurationError("initializer did not return a final assistant message")
+    try:
+        proposal = json.loads(
+            messages[-1],
+            object_pairs_hook=_strict_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (ValueError, TypeError) as error:
+        raise ConfigurationError(
+            f"initializer final message must be one JSON object: {error}"
+        ) from error
+    if (
+        not isinstance(proposal, dict)
+        or set(proposal) != {"plan", "init_script"}
+        or not isinstance(proposal["plan"], dict)
+        or not isinstance(proposal["init_script"], str)
+        or not proposal["init_script"].strip()
+        or "\0" in proposal["init_script"]
+    ):
+        raise ConfigurationError(
+            "initializer response must contain only a plan object and non-empty init_script"
+        )
+    return proposal
+
+
+def _validate_slice_plan(plan, tests, scope):
+    from .gate import _matches_path
+
+    if (
+        not isinstance(plan, dict)
+        or set(plan) != {"schema_version", "features"}
+        or type(plan["schema_version"]) is not int
+        or plan["schema_version"] != 1
+        or not isinstance(plan["features"], list)
+        or not plan["features"]
+    ):
+        raise ConfigurationError("slice plan must use schema_version 1 and contain features")
+
+    registered_ids = {test["id"] for test in tests["tests"]}
+    feature_ids = set()
+    slice_ids = set()
+    mapped_ids = []
+    id_pattern = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+    for feature in plan["features"]:
+        if (
+            not isinstance(feature, dict)
+            or set(feature) != {"id", "title", "slices"}
+            or not isinstance(feature["id"], str)
+            or id_pattern.fullmatch(feature["id"]) is None
+            or feature["id"] in feature_ids
+            or not isinstance(feature["title"], str)
+            or not feature["title"].strip()
+            or not isinstance(feature["slices"], list)
+            or not feature["slices"]
+        ):
+            raise ConfigurationError("slice plan contains an invalid feature")
+        feature_ids.add(feature["id"])
+        for item in feature["slices"]:
+            if (
+                not isinstance(item, dict)
+                or set(item) != {"id", "goal", "paths", "acceptance", "test_ids"}
+                or not isinstance(item["id"], str)
+                or id_pattern.fullmatch(item["id"]) is None
+                or item["id"] in slice_ids
+                or not isinstance(item["goal"], str)
+                or not item["goal"].strip()
+                or not isinstance(item["acceptance"], list)
+                or not item["acceptance"]
+                or any(
+                    not isinstance(criteria, str) or not criteria.strip()
+                    for criteria in item["acceptance"]
+                )
+                or not isinstance(item["paths"], list)
+                or not item["paths"]
+                or not isinstance(item["test_ids"], list)
+                or not item["test_ids"]
+            ):
+                raise ConfigurationError("slice plan contains an invalid slice")
+            slice_ids.add(item["id"])
+            for path in item["paths"]:
+                if (
+                    not isinstance(path, str)
+                    or not path
+                    or "\\" in path
+                    or any(character in path for character in "*?[]\0\r\n")
+                    or path.startswith("/")
+                    or (len(path) > 1 and path[1] == ":")
+                    or any(part in {"", ".", ".."} for part in path.split("/"))
+                    or path == ".factory/init.py"
+                ):
+                    raise ConfigurationError("slice plan contains an unsafe path")
+                if not any(_matches_path(pattern, path) for pattern in scope):
+                    raise ConfigurationError("slice plan path is outside approved scope")
+            if any(not isinstance(test_id, str) for test_id in item["test_ids"]):
+                raise ConfigurationError("slice plan contains invalid test IDs")
+            if len(set(item["test_ids"])) != len(item["test_ids"]):
+                raise ConfigurationError("slice plan contains invalid test IDs")
+            mapped_ids.extend(item["test_ids"])
+
+    if len(mapped_ids) != len(registered_ids) or set(mapped_ids) != registered_ids:
+        raise ConfigurationError("every registered test ID must appear exactly once")
+    return plan
+
+
+def _store_locked_artifact(path, content):
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise FactoryError(f"invalid locked artifact path: {path}")
+    if path.exists():
+        try:
+            existing = path.read_bytes()
+        except OSError as error:
+            raise FactoryError(f"cannot read locked artifact {path}: {error}") from error
+        if existing != content:
+            raise FactoryError(f"locked artifact already exists with different content: {path}")
+        return
+    _write_durable_artifact(path, content)
+
+
+def _validate_approved_plan_artifacts(job_dir, event):
+    expected = {
+        "plan_path": ("slice-plan.json", "plan_sha256"),
+        "init_script_path": ("init.py", "init_script_sha256"),
+    }
+    for path_field, (expected_path, hash_field) in expected.items():
+        digest = event.get(hash_field)
+        if (
+            event.get(path_field) != expected_path
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        ):
+            raise ConfigurationError("invalid approved slice plan metadata")
+        artifact = job_dir / expected_path
+        if artifact.is_symlink() or not artifact.is_file():
+            raise ConfigurationError("approved slice plan artifact is missing or invalid")
+        try:
+            actual_digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+        except OSError as error:
+            raise ConfigurationError(f"cannot read approved slice plan: {error}") from error
+        if actual_digest != digest:
+            raise ConfigurationError("approved slice plan artifact hash mismatch")
+
+    scope_path = job_dir / "scope.json"
+    if (
+        event.get("init_script_target") != ".factory/init.py"
+        or not isinstance(event.get("scope_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", event["scope_sha256"]) is None
+        or not isinstance(event.get("setup_commit"), str)
+        or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", event["setup_commit"])
+        is None
+        or scope_path.is_symlink()
+        or not scope_path.is_file()
+    ):
+        raise ConfigurationError("invalid approved initializer metadata")
+    try:
+        scope_hash = hashlib.sha256(scope_path.read_bytes()).hexdigest()
+    except OSError as error:
+        raise ConfigurationError(f"cannot read approved scope: {error}") from error
+    if scope_hash != event["scope_sha256"]:
+        raise ConfigurationError("approved scope hash mismatch")
+
+
+def _validate_initializer_failure_event(job_dir, event, previous):
+    attempt_id = event.get("attempt_id")
+    if (
+        not isinstance(attempt_id, str)
+        or re.fullmatch(r"[0-9a-f]{32}", attempt_id) is None
+        or event.get("failure_stage") != "initializer"
+        or event.get("failure_outcome") not in {"BUDGET", "TIMEOUT", "ERROR"}
+        or not isinstance(event.get("failure_reason"), str)
+        or not event["failure_reason"].strip()
+        or (
+            event.get("session_id") is not None
+            and (
+                not isinstance(event["session_id"], str)
+                or not event["session_id"].strip()
+            )
+        )
+        or previous.get("type") != "INITIALIZER_RUN_STARTED"
+        or previous.get("attempt_id") != attempt_id
+        or previous.get("task_sha256") != event.get("task_sha256")
+        or previous.get("scope_sha256") != event.get("scope_sha256")
+        or previous.get("profile") != event.get("profile")
+    ):
+        raise ConfigurationError("invalid initializer failure metadata")
+    _validate_initializer_attempt(job_dir, event)
+    run_dir = event.get("run_dir")
+    if run_dir is not None:
+        if not isinstance(run_dir, str) or re.fullmatch(r"runs/[1-9][0-9]*", run_dir) is None:
+            raise ConfigurationError("invalid initializer diagnostic directory")
+        diagnostic_dir = job_dir / run_dir
+        if diagnostic_dir.is_symlink() or not diagnostic_dir.is_dir():
+            raise ConfigurationError("initializer diagnostics are missing or invalid")
+
+
+def register_slice_plan(factory_root, job_id, plan_path, init_script_path, approved):
+    if not approved:
+        raise ConfigurationError("slice plan registration requires explicit --approve")
+    if init_script_path is None:
+        raise ConfigurationError("slice plan registration requires --init-script")
+
+    def read_source(path, label):
+        source = Path(path)
+        if source.is_symlink():
+            raise ConfigurationError(f"{label} path must not be a symlink")
+        try:
+            source = source.resolve(strict=True)
+        except (OSError, RuntimeError) as error:
+            raise ConfigurationError(f"invalid {label} path: {path}") from error
+        if not source.is_file():
+            raise ConfigurationError(f"{label} path is not a regular file: {path}")
+        try:
+            return source.read_bytes()
+        except OSError as error:
+            raise ConfigurationError(f"cannot read {label}: {error}") from error
+
+    plan_content = read_source(plan_path, "slice plan")
+    script_content = read_source(init_script_path, "initializer script")
+    try:
+        plan = json.loads(
+            plan_content,
+            object_pairs_hook=_strict_json_object,
+            parse_constant=_reject_json_constant,
+        )
+        script_text = script_content.decode("utf-8")
+    except (ValueError, UnicodeDecodeError) as error:
+        raise ConfigurationError(f"invalid slice plan or initializer script: {error}") from error
+    try:
+        compile(script_text, ".factory/init.py", "exec")
+    except SyntaxError as error:
+        raise ConfigurationError(f"initializer script is invalid Python: {error}") from error
+
+    job_id, job_dir = _job_location(factory_root, job_id)
+    with _job_lock(job_dir):
+        current = _read_job_contents(job_dir, job_id)
+        job = JobRecord.model_validate(current["job"])
+        if job.state != "TESTS_RED_OK":
+            raise ConfigurationError("slice plan approval requires TESTS_RED_OK")
+        if current["last_event"]["type"] != "INITIALIZER_RUN_COMPLETED":
+            raise ConfigurationError("slice plan approval requires a completed initializer run")
+        if job.worktree_status != "attached" or not job.worktree_path:
+            raise ConfigurationError("slice plan approval requires an attached worktree")
+
+        worktree = Path(job.worktree_path)
+        if worktree.is_symlink() or not worktree.is_dir():
+            raise ConfigurationError("slice plan worktree is missing or invalid")
+        from .gate import _matches_path, _read_scope_manifest
+
+        scope = _read_scope_manifest(job_dir, worktree)
+        scope_path = job_dir / "scope.json"
+        scope_content = scope_path.read_bytes()
+        scope_sha256 = hashlib.sha256(scope_content).hexdigest()
+        if scope_sha256 != current["last_event"].get("scope_sha256"):
+            raise ConfigurationError("approved scope changed after initializer run")
+        tests = json.loads(
+            (job_dir / "tests.json").read_bytes(),
+            object_pairs_hook=_strict_json_object,
+            parse_constant=_reject_json_constant,
+        )
+        _validate_slice_plan(plan, tests, scope)
+        if not any(_matches_path(pattern, ".factory/init.py") for pattern in scope):
+            raise ConfigurationError("initializer script path is outside approved scope")
+
+        factory_script = job_dir / "init.py"
+        stored_plan = job_dir / "slice-plan.json"
+        _store_locked_artifact(stored_plan, (json.dumps(
+            plan, indent=2, sort_keys=True
+        ) + "\n").encode("utf-8"))
+        _store_locked_artifact(factory_script, script_content)
+
+        target_script = worktree / ".factory" / "init.py"
+        if (
+            (worktree / ".factory").is_symlink()
+            or not (worktree / ".factory").is_dir()
+            or target_script.is_symlink()
+            or target_script.exists()
+        ):
+            raise ConfigurationError("initializer target path is missing or already exists")
+        if _run_git(
+            worktree,
+            ["status", "--porcelain", "--untracked-files=all", "--ignored"],
+            "check plan approval worktree",
+        ):
+            raise FactoryError("plan approval requires a clean worktree")
+        _write_durable_artifact(target_script, script_content)
+        _run_git(worktree, ["add", "--", ".factory/init.py"], "stage initializer script")
+        _run_git(
+            worktree,
+            [
+                "commit",
+                "--only",
+                "-m",
+                "Add approved initializer setup",
+                "--",
+                ".factory/init.py",
+            ],
+            "commit initializer script",
+        )
+        changed_paths = _run_git(
+            worktree,
+            ["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"],
+            "verify initializer commit",
+        ).splitlines()
+        if changed_paths != [".factory/init.py"]:
+            raise FactoryError("initializer setup commit contains unexpected files")
+        setup_commit = _run_git(
+            worktree, ["rev-parse", "HEAD"], "record initializer commit"
+        )
+        committed_script = subprocess.run(
+            ["git", "show", f"{setup_commit}:.factory/init.py"],
+            cwd=worktree,
+            capture_output=True,
+            check=False,
+        )
+        if committed_script.returncode:
+            detail = committed_script.stderr.decode("utf-8", errors="replace").strip()
+            raise FactoryError(f"verify committed initializer script failed: {detail}")
+        if committed_script.stdout != script_content:
+            raise FactoryError("initializer commit content does not match approved script")
+
+        persisted = _record_state_change(
+            job_dir,
+            current,
+            "BUILDING",
+            "Approved slice plan registered",
+            details={
+                "plan_path": "slice-plan.json",
+                "plan_sha256": hashlib.sha256(stored_plan.read_bytes()).hexdigest(),
+                "init_script_path": "init.py",
+                "init_script_target": ".factory/init.py",
+                "init_script_sha256": hashlib.sha256(script_content).hexdigest(),
+                "scope_sha256": scope_sha256,
+                "setup_commit": setup_commit,
+            },
+        )
+        return persisted
+
+
+def _initializer_run_dir(job_dir, result, *, required):
+    raw_path = result.paths.get("run_dir")
+    if raw_path is None:
+        if required:
+            raise ConfigurationError("initializer run directory is missing")
+        return None, None
+    run_dir = Path(raw_path)
+    if not run_dir.is_absolute() or run_dir.is_symlink():
+        if required:
+            raise ConfigurationError("initializer run directory is invalid")
+        return None, None
+    runs_root = (job_dir / "runs").resolve()
+    try:
+        run_dir = run_dir.resolve(strict=True)
+        run_dir.relative_to(runs_root)
+    except (OSError, RuntimeError, ValueError) as error:
+        if required:
+            raise ConfigurationError(
+                "initializer run artifacts are outside the job"
+            ) from error
+        return None, None
+    if run_dir.parent != runs_root or not re.fullmatch(r"[1-9][0-9]*", run_dir.name):
+        if required:
+            raise ConfigurationError("initializer run directory is invalid")
+        return None, None
+    return run_dir, run_dir.relative_to(job_dir).as_posix()
+
+
+def _record_initializer_failure(
+    job_dir,
+    job_id,
+    attempt_id,
+    profile_name,
+    scope_sha256,
+    task_sha256,
+    outcome,
+    reason,
+    run_dir,
+    session_id,
+):
+    if outcome not in {"BUDGET", "TIMEOUT", "ERROR"}:
+        outcome = "ERROR"
+    reason = str(reason).strip() or "initializer failed without a diagnostic"
+    with _job_lock(job_dir):
+        current = _read_job_contents(job_dir, job_id)
+        job = JobRecord.model_validate(current["job"])
+        if (
+            job.state != "TESTS_RED_OK"
+            or current["last_event"]["type"] != "INITIALIZER_RUN_STARTED"
+            or current["last_event"].get("attempt_id") != attempt_id
+        ):
+            raise FactoryError("job changed during initializer failure handling")
+        return _record_state_change(
+            job_dir,
+            current,
+            "NEEDS_HUMAN",
+            f"Initializer failed: {reason}",
+            details={
+                "failure_stage": "initializer",
+                "attempt_id": attempt_id,
+                "profile": profile_name,
+                "scope_sha256": scope_sha256,
+                "task_sha256": task_sha256,
+                "failure_outcome": outcome,
+                "failure_reason": reason,
+                "run_dir": run_dir,
+                "session_id": session_id,
+            },
+        )
+
+
+def initialize_job(factory_root, job_id, profile_name):
+    job_id, job_dir = _job_location(factory_root, job_id)
+    factory_root = Path(factory_root).resolve()
+    with _job_lock(job_dir):
+        current = _read_job_contents(job_dir, job_id)
+        job = JobRecord.model_validate(current["job"])
+        if job.state != "TESTS_RED_OK":
+            raise ConfigurationError("initializer requires TESTS_RED_OK")
+        if current["last_event"]["type"] in {
+            "INITIALIZER_RUN_STARTED",
+            "INITIALIZER_RUN_COMPLETED",
+        }:
+            raise ConfigurationError("initializer attempt already exists; resume for a retry")
+        if job.worktree_status != "attached" or not job.worktree_path:
+            raise ConfigurationError("initializer requires an attached worktree")
+
+        config = _load_model(factory_root / "config.json", FactoryConfig)
+        if profile_name not in config.profiles:
+            raise ConfigurationError(f"unknown runner profile: {profile_name}")
+        profile = config.profiles[profile_name]
+
+        worktree = Path(job.worktree_path)
+        if worktree.is_symlink() or not worktree.is_dir():
+            raise ConfigurationError("initializer worktree is missing or invalid")
+        from .gate import _read_scope_manifest
+
+        scope = _read_scope_manifest(job_dir, worktree)
+        if _run_git(
+            worktree,
+            ["status", "--porcelain", "--untracked-files=all", "--ignored"],
+            "check initializer worktree",
+        ):
+            raise FactoryError("initializer requires a clean worktree")
+
+        spec_content = (job_dir / "spec.md").read_bytes()
+        tests_content = (job_dir / "tests.json").read_bytes()
+        tests = json.loads(tests_content, object_pairs_hook=_strict_json_object)
+        task_content = _initializer_task(spec_content, tests, scope).encode("utf-8")
+        initializer_dir = job_dir / "initializer"
+        if initializer_dir.is_symlink() or (
+            initializer_dir.exists() and not initializer_dir.is_dir()
+        ):
+            raise FactoryError("invalid initializer artifact directory")
+        initializer_dir.mkdir(exist_ok=True)
+        attempt_id = uuid4().hex
+        attempt_dir = initializer_dir / f"attempt-{attempt_id}"
+        attempt_dir.mkdir()
+        task_snapshot = attempt_dir / "task.md"
+        task_file = worktree / ".factory" / "task.md"
+        if (
+            (worktree / ".factory").is_symlink()
+            or not (worktree / ".factory").is_dir()
+            or task_file.is_symlink()
+            or task_file.exists()
+        ):
+            attempt_dir.rmdir()
+            raise ConfigurationError("initializer task path is missing or already exists")
+        _write_durable_artifact(task_snapshot, task_content)
+        try:
+            _write_durable_artifact(task_file, task_content)
+        except OSError:
+            task_snapshot.unlink(missing_ok=True)
+            attempt_dir.rmdir()
+            raise
+
+        scope_sha256 = hashlib.sha256((job_dir / "scope.json").read_bytes()).hexdigest()
+        task_sha256 = hashlib.sha256(task_content).hexdigest()
+        start_event = {
+            "seq": current["last_event"]["seq"] + 1,
+            "ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "job_id": job_id,
+            "type": "INITIALIZER_RUN_STARTED",
+            "actor": getpass.getuser(),
+            "reason": "Initializer session started",
+            "data": job.model_dump(mode="json"),
+            "attempt_id": attempt_id,
+            "profile": profile_name,
+            "scope_sha256": scope_sha256,
+            "task_sha256": task_sha256,
+        }
+        _persist_event(job_dir, start_event, job)
+
+    from .runner import run_agent
+
+    task_unchanged = False
+    result = None
+    try:
+        result = run_agent(
+            profile.agent,
+            profile,
+            task_file,
+            worktree,
+            f"initializer-{job_id[:8]}",
+        )
+    except (ConfigurationError, FactoryError, OSError) as error:
+        failure = _record_initializer_failure(
+            job_dir,
+            job_id,
+            attempt_id,
+            profile_name,
+            scope_sha256,
+            task_sha256,
+            "ERROR",
+            str(error),
+            None,
+            None,
+        )
+        raise FactoryError(
+            f"initializer failed and requires human attention: {failure['job']['state']}: {error}"
+        ) from error
+    finally:
+        if task_file.is_file() and not task_file.is_symlink():
+            try:
+                task_unchanged = task_file.read_bytes() == task_content
+                if task_unchanged:
+                    task_file.unlink()
+            except OSError:
+                task_unchanged = False
+
+    try:
+        run_dir, run_dir_relative = _initializer_run_dir(
+            job_dir, result, required=result.outcome == "OK"
+        )
+    except ConfigurationError as error:
+        _record_initializer_failure(
+            job_dir,
+            job_id,
+            attempt_id,
+            profile_name,
+            scope_sha256,
+            task_sha256,
+            "ERROR",
+            str(error),
+            None,
+            result.session_id,
+        )
+        raise FactoryError(
+            f"initializer session failed and requires human attention: {error}"
+        ) from error
+
+    if result.outcome != "OK":
+        _record_initializer_failure(
+            job_dir,
+            job_id,
+            attempt_id,
+            profile_name,
+            scope_sha256,
+            task_sha256,
+            result.outcome,
+            result.error or result.outcome,
+            run_dir_relative,
+            result.session_id,
+        )
+        raise FactoryError(
+            f"initializer session failed and requires human attention: "
+            f"{result.error or result.outcome}"
+        )
+
+    try:
+        if not task_unchanged:
+            raise FactoryError("initializer changed or removed its task file")
+        if _run_git(
+            worktree,
+            ["status", "--porcelain", "--untracked-files=all", "--ignored"],
+            "verify initializer worktree",
+        ):
+            raise FactoryError("initializer changed the target worktree")
+        stdout_path = Path(result.paths.get("stdout", ""))
+        if not stdout_path.is_absolute() or stdout_path.is_symlink() or not stdout_path.is_file():
+            raise ConfigurationError("initializer output is missing or invalid")
+        try:
+            stdout_path = stdout_path.resolve(strict=True)
+            stdout_path.relative_to(run_dir)
+        except (OSError, RuntimeError, ValueError) as error:
+            raise ConfigurationError(
+                "initializer output is outside its run directory"
+            ) from error
+        proposal = _parse_initializer_response(stdout_path)
+        plan_content = (
+            json.dumps(proposal["plan"], indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        compile(proposal["init_script"], ".factory/init.py", "exec")
+        script_content = proposal["init_script"].encode("utf-8")
+        if hashlib.sha256((job_dir / "scope.json").read_bytes()).hexdigest() != scope_sha256:
+            raise ConfigurationError("approved scope changed during initializer session")
+        plan_path = attempt_dir / "slice-plan.json"
+        script_path = attempt_dir / "init.py"
+        _write_durable_artifact(plan_path, plan_content)
+        _write_durable_artifact(script_path, script_content)
+    except (ConfigurationError, FactoryError, OSError, SyntaxError, UnicodeError) as error:
+        _record_initializer_failure(
+            job_dir,
+            job_id,
+            attempt_id,
+            profile_name,
+            scope_sha256,
+            task_sha256,
+            "ERROR",
+            str(error),
+            run_dir_relative,
+            result.session_id,
+        )
+        raise FactoryError(
+            f"initializer output rejected and requires human attention: {error}"
+        ) from error
+
+    with _job_lock(job_dir):
+        current = _read_job_contents(job_dir, job_id)
+        job = JobRecord.model_validate(current["job"])
+        if (
+            job.state != "TESTS_RED_OK"
+            or current["last_event"]["type"] != "INITIALIZER_RUN_STARTED"
+            or current["last_event"].get("attempt_id") != attempt_id
+        ):
+            raise FactoryError("job changed while initializer was running")
+        event = {
+            "seq": current["last_event"]["seq"] + 1,
+            "ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "job_id": job_id,
+            "type": "INITIALIZER_RUN_COMPLETED",
+            "actor": getpass.getuser(),
+            "reason": "Initializer proposal recorded",
+            "data": job.model_dump(mode="json"),
+            "attempt_id": attempt_id,
+            "profile": profile_name,
+            "outcome": "OK",
+            "run_dir": run_dir_relative,
+            "session_id": result.session_id,
+            "scope_sha256": scope_sha256,
+            "task_sha256": task_sha256,
+            "plan_path": f"initializer/attempt-{attempt_id}/slice-plan.json",
+            "plan_sha256": hashlib.sha256(plan_content).hexdigest(),
+            "init_script_path": f"initializer/attempt-{attempt_id}/init.py",
+            "init_script_sha256": hashlib.sha256(script_content).hexdigest(),
+        }
+        persisted = _persist_event(job_dir, event, job)
+        persisted["proposal"] = {
+            "plan_path": event["plan_path"],
+            "plan_sha256": event["plan_sha256"],
+            "init_script_path": event["init_script_path"],
+            "init_script_sha256": event["init_script_sha256"],
+        }
+        return persisted
 
 
 def _record_worktree_event(job_dir, current, event_type, reason, changes):
