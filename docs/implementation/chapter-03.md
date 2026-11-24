@@ -10,6 +10,13 @@
 This contract defines the factory-side Gate and its target-project checks interface. It does not
 modify `design.md`. Implementation starts only after explicit approval of this contract.
 
+> **Implementation status clarification — 2026-11-24:** The approved Chapter 4 text below specifies
+> a `baseline` Gate mode, but the current `factory job gate` CLI accepts only `fast|full` with an
+> optional slice ID. Baseline-red remains a separate `checks.py --red` input-readiness check.
+> This clarification records current behavior; it does not silently expand the CLI or revise the
+> approved M1 contract. Reconcile the specified baseline Gate mode under a separate approved change
+> before relying on it.
+
 ## 1. Scope
 
 ### Goals
