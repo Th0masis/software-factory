@@ -1,497 +1,694 @@
 # Chapters 3, 5, and 6 — Baseline, Test Author, and Feature Validation Contract
 
-- **Status:** Revised draft for approval. The workflow and exception direction were confirmed in
-  discussion; the implementation details below require approval before coding.
-- **Source:** [`design.md`](../../design.md), Chapters 3–6, and DD-25 through DD-31 in
+- **Status:** Draft for explicit approval; not authorization to write production code.
+- **Scope:** New jobs only. Existing M1 jobs and records retain their current behavior.
+- **Inputs:** [`design.md`](../../design.md), [`chapter-01.md`](./chapter-01.md),
+  [`chapter-03.md`](./chapter-03.md), [`chapter-04.md`](./chapter-04.md), and
   [`design-deviations.md`](./design-deviations.md).
-- **Related M1 contract:** [`chapter-04.md`](./chapter-04.md) remains authoritative for existing
-  human-prepared jobs. The new-job workflow proposed here changes their future defaults without
-  reinterpreting existing jobs.
-- **Proposed amendments:** Before implementation, approval of this draft must explicitly resolve
-  the conflicting worktree-ordering and Gate requirements in Chapters 1, 3, and 4 and DD-03,
-  DD-08, DD-26, DD-29, and DD-30. This draft does not silently revise those approved records.
+- **Decision provenance:** The workflow direction and the choices identified in section 10 were
+  discussed with the user on 2026-11-24. The exact interfaces, schemas, and slices below are
+  proposed for review; they are not yet approved.
+- **Earlier contracts:** Section 10 identifies proposed amendments. This draft does not itself
+  amend previously approved documents or the decision register.
 
-## 1. Goal and scope
+## 1. Goal and boundaries
 
-For each new job, establish the target project's initial test state before specification approval
-or project changes, then automatically run Test Author after spec approval. Preserve approved
-independent tests in the target project and provide traceable Gate evidence for every required
-Acceptance Criterion (AC).
+For each new job, run a full build and the complete existing project test suite before G0. Preserve
+the results as the job's initial baseline. A job may contain multiple features; it has one accepted
+initial baseline and one final full Gate, not one of each per feature.
 
-One job may contain multiple features and ordered slices. Run one initial baseline for the job,
-Slice Gate after each slice, and one final full Gate for the complete job. Keep one deterministic
-Gate implementation. Builder commits before Slice Gate; only PASS or an explicitly qualified
-PASS_WITH_EXCEPTION records a slice as passed. Final validation runs the complete project
-test/check suite before review.
+After G0, automatically start a separate Test Author session. A human reviews its exact new test
+files and mappings at G1. The Factory then verifies baseline-red and creates a test-only checkpoint
+before the initializer and Builder. Builder commits each slice before its Slice Gate. After all
+slices, the final Gate runs the complete build and tests and evaluates every feature's ACs.
 
-### In scope
+The Factory keeps one Gate engine. The initial baseline, baseline-red, Slice Gate, and final Gate
+are different operations:
 
-- Stable AC IDs and strict validation of AC-to-test coverage.
-- Pre-specification worktree attachment, test-environment discovery, and initial baseline.
-- Explicit human-approved exceptions for identifiable pre-existing test failures.
-- Automatic Test Author invocation using a separate configured profile, with model family configurable.
-- Post-run path-scope validation, G1 approval, baseline-red validation, and an orchestrator-owned
-  test-only checkpoint.
-- Distinct original job base, approved Gate base, per-attempt comparison base, and tested head.
-- Gate report schema v2 and recovery for interrupted checkpoint/report creation.
-- Focused unit, CLI, and temporary-Git integration tests.
+| Operation | Purpose | Test scope |
+|---|---|---|
+| Initial baseline | Record the project's starting state | Full build and all existing tests, once per accepted job baseline |
+| Baseline-red | Verify new acceptance tests fail before implementation | All approved Test Author tests against `job_base_sha` |
+| Slice Gate | Verify one committed implementation step | Selected slice tests and applicable fast regressions, excluding pending job tests |
+| Final Gate / Feature Validation | Validate the entire job | Full build, all project tests, and all ACs for each feature |
 
-### Out of scope
+Baseline-red is input readiness, not a Gate mode. There is no separate per-slice baseline Gate
+execution. The final Gate reports each feature separately but is run once after all features, not
+once per feature. Risk routing, automatic retries, CI changes, and push/PR/merge automation remain
+out of scope. A human publishes the PR.
 
-- Reinterpreting or rewriting existing M1 jobs, their events, or their artifacts.
-- OS-level sandboxing of the Test Author.
-- Automatic retries, risk routing, or E2E selection; those belong to Chapter 9 and Chapter 7.
-- Treating manual verification as passing automated AC evidence.
-- Automatic CI/test-infrastructure changes, Git push, PR creation, or merge.
-- A second Gate engine, a new test framework, or a Factory-wide required test directory.
+## 2. Compatibility and trust
 
-## 2. Compatibility and job workflow
+### 2.1 Workflow selection
 
-Existing M1 jobs continue using their current registration, baseline-red, Gate, and recovery
-behavior, including existing states, transitions, report schemas, and event replay. They must not
-be reinterpreted as new-workflow jobs. Existing report files remain immutable and are not migrated.
+`JOB_CREATED` for a new job records `workflow_version: 2` durably. A legacy `JOB_CREATED` without
+that field selects M1. Replay must reject an unknown version and must not infer the workflow from
+later config or missing report fields. M1's existing state transitions, target-owned
+`.factory/checks.py`, v1 manifests and reports, CLI behavior, event replay, and recovery remain
+unchanged. Do not rewrite or migrate old events, snapshots, manifests, or reports.
 
-Once this workflow is implemented, new jobs default to an initial baseline and Test Author; neither
-requires an opt-in. The workflow version must be recorded durably at job creation so replay does
-not infer it from missing fields or later configuration. Legacy records without that version
-continue on the M1 path. New workflow stages must not become prerequisites for existing M1 jobs.
+New-workflow validation is version-specific. In particular, qualified verdicts and pre-G0
+attachment must not become M1 prerequisites or be interpreted as M1 `PASS`. The old report reader
+continues to read existing v1 records. New v2 reports are not written over old reports.
 
-The initial worktree is attached while the job is in `DRAFT_SPEC`, before G0. As in M1, a person
-prepares an existing local branch; Factory does not create, reset, push, or delete it. The attached
-branch HEAD is the first baseline's candidate SHA. Once a baseline or its exception disposition
-is accepted, its SHA becomes `job_base_sha`. The baseline is run once for the job, not once per
-feature or slice. If the branch HEAD or relevant environment changes before Test Author begins,
-the original baseline cannot silently be reused: preserve the evidence and require a new baseline
-for the actual starting SHA and environment. If the SHA changes after G0, require fresh human
-specification approval against the new baseline before Test Author starts.
+### 2.2 Trust boundary
 
-The proposed user-facing operations are:
+The target repository, its approved build/test commands, and its test runner are trusted code. The
+Factory-owned adapter is also trusted only after explicit human approval. Hashes prove that approved
+bytes were not changed; they do not prove that a command actually tested the claimed behavior or
+that the runner discovered every test it should have discovered.
+
+Agent permissions, Git validation, and post-run checks are not an OS sandbox. They cannot prove
+that ignored files, external services, another process, or temporary writes were untouched. A
+matching failure fingerprint cannot prove an unchanged root cause. The user selected automatic
+matching with that residual risk; the Factory must disclose it, never claim that a match proves
+there is no new error, and block on changed or ambiguous evidence.
+
+## 3. Project checks setup and environment
+
+### 3.1 Factory-owned adapter
+
+New jobs do not require the target project to contain `.factory/checks.py`. A project has a
+Factory-owned adapter and configuration stored outside its target worktree. The project key must
+identify one canonical project root without colliding with another project. The Factory retains
+immutable approved adapter revisions and binds each job attempt to the exact revision.
+
+If no approved adapter exists, the Factory may inspect the project's test layout, build
+configuration, and CI conventions and propose an adapter and commands. Discovery is informational:
+it must not run guessed commands, install packages, edit target configuration or CI, or silently
+approve a proposal. A human reviews and explicitly approves the exact adapter bytes, command
+argument arrays, required checks, test-discovery mechanism, environment identity inputs, and
+project identity before the adapter or its commands run. Any change requires a new approval.
+
+An adapter runs in the target worktree. Commands use argument arrays with `shell=False`, bounded
+timeouts and process-tree termination, and the existing configured secret-environment removal.
+There is no automatic project setup or CI modification. If the project already provides a complete
+test check, use it and the required build; do not run the same build twice if the approved check
+already performs it. Otherwise, use the project's approved test-discovery commands. Do not hard-code
+only the tests present during setup: newly added project tests must be discovered by `full`.
+
+The adapter must use the runner's reliable machine-readable output, or an equivalently unambiguous
+supported output, to produce the v2 report in section 4. If it cannot establish unique test IDs,
+complete discovery, outcomes, and the requested selection, it fails closed and proposes a
+separately approved reporting or infrastructure change. It must not infer individual outcomes
+from aggregate counts. A successful discovery of zero existing tests is valid if the runner itself
+is usable and the build succeeds; record zero explicitly. New acceptance tests are still required.
+
+### 3.2 Environment identity
+
+Each approved adapter config identifies the build/test executables and interpreter, and the
+repository-relative dependency and configuration files whose identity matters. Before each
+attempt, the Factory records:
+
+- OS/platform and the interpreter and declared tools' executable identities and exact versions;
+- SHA-256 of the approved adapter and of its approved configuration, including commands and
+  selection rules;
+- for each declared dependency/configuration path, its relative path and SHA-256 of its bytes.
+
+Missing, unreadable, unsafe, or ambiguous identity inputs invalidate the attempt. Do not persist
+secret values in the identity or command configuration. The identity hash is SHA-256 over UTF-8
+JSON of this identity object with keys sorted and separators `,` and `:`; arrays retain their
+declared order. Record the object as well as its hash. Record each attempt's exact argument-array
+invocation and working directory separately; do not include mode-specific arguments or attempt
+paths in the environment hash, or `full` and `slice` could never match. This does not inventory
+all installed dependencies, ignored files, or external services; those limitations remain visible.
+
+If the recorded relevant environment or HEAD changes before Test Author begins, a new full
+baseline is required. If G0 was already approved, a person must approve G0 again against the new
+accepted baseline, even if only the environment changed. For a later exception match, a different
+or unavailable environment identity blocks automatic reuse and requires human review.
+
+## 4. Checks adapter v2
+
+### 4.1 Invocation and request
+
+The Factory invokes the approved Python adapter as an argument array:
 
 ```text
-factory job new --project PATH --title TITLE
-factory job worktree attach JOB_ID --branch LOCAL_BRANCH
-factory job prepare JOB_ID --stage spec --path SPEC_PATH --approve
-factory job prepare JOB_ID --stage tests --path CANDIDATE_MANIFEST --approve
+python <factory-owned-adapter> --mode full|slice|red --request <absolute-factory-owned-json>
 ```
 
-For a new-workflow job, orchestration automatically performs preflight, discovery, and baseline
-after attachment, and automatically starts Test Author after successful G0. It uses a configured
-Test Author profile, not an arbitrary model or permission supplied by an agent. The exact commands
-for baseline failure repair, exception approval, and explicit continuation after interruption
-remain open for approval; none may silently approve a failure or automatically retry an agent.
+The request is an immutable attempt artifact. Its exact fields are `schema_version: 2`, `job_id`,
+`attempt_id`, `mode`, `head_sha`, `adapter_sha256`, `selected_ids`, `excluded_ids`,
+`manifest_path`, `manifest_sha256`, and `request_sha256`. All IDs are strings, hashes are
+lowercase SHA-256, and SHAs identify full commits. Mode-specific values are:
 
-The Test Author's final response contains a strict JSON candidate manifest with test IDs,
-project-relative paths, and AC IDs. The orchestrator validates it and writes the candidate manifest
-under the factory-owned job directory; the agent cannot write job data directly. The human reviews
-that exact manifest and worktree diff through G1 registration.
+- `full`: `selected_ids: []`, `excluded_ids: []`, `manifest_sha256: null`.
+- `slice`: exact `selected_ids` from the approved slice, exact `excluded_ids` for still-pending
+  Test Author tests, and the approved full manifest hash in `manifest_sha256`.
+- `red`: all approved Test Author test IDs in `selected_ids`, `excluded_ids: []`, and the approved
+  manifest hash. `head_sha` is `job_base_sha`; the new test files are present as the only approved
+  uncommitted additions on top of that commit.
 
-Candidate shape:
+`request_sha256` is computed by the Factory over the same canonical JSON encoding as section 3.2,
+omitting `request_sha256` itself. IDs in each list are unique and the selected and excluded sets
+are disjoint. `manifest_path` is null for `full`; otherwise it is the absolute path of the approved
+manifest. Request and manifest hashes are checked before and after the process. Each is a regular
+non-symlink Factory artifact.
+
+### 4.2 Report and process result
+
+The adapter writes exactly one JSON object to stdout; diagnostics go to stderr. Its report has this
+shape:
+
+```json
+{
+  "schema_version": 2,
+  "job_id": "job-id",
+  "attempt_id": "attempt-id",
+  "mode": "full",
+  "head_sha": "full-commit-sha",
+  "request_sha256": "64-lowercase-hex",
+  "manifest_sha256": null,
+  "discovery_complete": true,
+  "selected_ids": [],
+  "excluded_ids": [],
+  "discovered_ids": ["tests/test_login.py::test_login"],
+  "checks": [
+    {"id": "build", "kind": "build", "status": "PASS", "exit_code": 0},
+    {"id": "unit", "kind": "test", "status": "PASS", "exit_code": 0}
+  ],
+  "tests": [
+    {
+      "id": "tests/test_login.py::test_login",
+      "check_id": "unit",
+      "outcome": "PASS",
+      "failure": null
+    }
+  ]
+}
+```
+
+The example omits additional project checks, not required fields. `checks` contains each check ID
+configured for the requested mode exactly once, with `kind` `build`, `test`, or `other`; its
+`status` is `PASS`, `FAIL`,
+`SKIPPED`, or `NOT_EXECUTED`. `exit_code` is an integer or null if no process completed. Optional
+checks are explicitly identified in the approved configuration, not inferred from their result.
+Test `outcome` is `PASS`, `ASSERTION_FAILURE`, `ERROR`, `SKIPPED`, or `NOT_EXECUTED`.
+`failure` is null for PASS, SKIPPED, or NOT_EXECUTED; for a failure it is
+`{"category": "assertion|error", "evidence": "non-empty text"}`. The category must agree with
+the outcome. `check_id` identifies exactly one declared test-kind check. Test IDs are unique
+across the attempt, even if a runner could otherwise execute the same test twice. The adapter
+records native process exit codes and forwards captured native stdout/stderr to its stderr log.
+The approved configuration defines the native runner exit codes that mean completed tests versus
+infrastructure failure. A failed test check is eligible for exception evaluation only if the
+runner completed and every failure in that check is represented by its individual test results;
+an unattributed process failure is never eligible.
+
+All IDs are non-empty, stable, unique runner selectors. Duplicate JSON keys, unknown enum values,
+malformed IDs, duplicate IDs, missing fields, inconsistent metadata, or unrecognized fields fail
+closed. Every discovered ID has exactly one test result; selected IDs must be discovered and
+executed. In `full`, discovery covers the complete project test process and no ID is excluded.
+In `slice`, the adapter reports the actual discovered and executed set, including the selected
+tests and applicable approved fast regressions, and proves no excluded ID executed. If an excluded
+ID is discovered, its result is `NOT_EXECUTED` and it is not a required test for that attempt.
+In `red`, the discovery and result sets are exactly the selected IDs. An adapter that cannot
+establish these properties must not claim success.
+
+The adapter process returns `0` only when it completed and emitted a valid report, even when a
+test failed. A nonzero adapter exit, timeout, interruption, launch failure, incomplete discovery,
+or missing/malformed report is infrastructure failure. The project runner may itself use a
+nonzero code for a normal test failure; the adapter must distinguish that from an incomplete or
+failed runner and record the actual code. The Factory validates both the adapter exit and report.
+It never converts a process error, a skipped check, or incomplete execution into a qualified pass.
+
+### 4.3 Slice selection proof
+
+The approved adapter configuration defines the project's fast regression check IDs and their
+selection mechanism. Before a slice, Factory constructs the selected IDs from the approved plan
+and excludes Test Author IDs belonging to future, unpassed slices. The adapter runs:
+
+1. every selected test for the current slice;
+2. all applicable configured fast regression checks and their discovered tests;
+3. no excluded pending Test Author test.
+
+Previously completed acceptance tests run again only if they belong to the configured fast
+regressions. Other completed acceptance tests are required at final Gate, not every slice. The
+adapter must produce the actual ID set and results for both selected tests and regressions; it
+must not merely echo the request. Missing a required regression check, inability to exclude pending
+tests, or inability to demonstrate actual execution fails the Gate. The Factory compares the
+report with the request and configuration. This proof depends on the trusted adapter and runner;
+it is not independent verification of their honesty.
+
+## 5. Initial baseline and exceptions
+
+### 5.1 Initial attempt and acceptance
+
+A person prepares an existing local branch. After pre-G0 attachment, the Factory checks the
+worktree is clean of tracked and untracked non-ignored changes, records HEAD as `candidate_sha`,
+verifies the approved adapter and environment, and automatically invokes `full`. If adapter setup
+is pending, the job stops before any guessed command is run. After setup or repair, a person uses
+the explicit baseline command in section 9.
+
+The Factory checks HEAD, tracked files, and untracked non-ignored files both before and after the
+attempt. A dirty worktree or changed HEAD invalidates the attempt even if the checks claim PASS.
+The before/after checks do not prove that transient writes did not occur. Raw stdout/stderr,
+request, environment identity, actual results, timestamps, and immutable report are retained.
+
+Every attempt has its own `candidate_sha`. Before acceptance `job_base_sha` is null. A valid
+all-passing attempt gets an accepted baseline disposition of `PASS`. If tests fail, the immutable
+attempt stays `FAIL`; G0 is blocked until repair plus a new full baseline or a disposition accepting
+every eligible failing test by an explicit human exception. That separate disposition is
+`PASS_WITH_EXCEPTION` and refers to the failed report and all approvals. Only then does
+`job_base_sha` become the accepted `candidate_sha`. A failed build, infrastructure error, missing
+or skipped required check, incomplete test, or invalid report is not waivable.
+
+### 5.2 Exception evidence and approval
+
+An exception covers one existing project test ID that was discovered and executed as an
+`ASSERTION_FAILURE` in the accepted initial attempt. It cannot cover a suite, build failure, test
+setup/import/syntax error, interrupted check, skipped or unexecuted test, a new acceptance test,
+scope or integrity violation, or any missing report. A required AC always needs passing automated
+evidence. Every failing baseline test needs its own approval; any non-eligible failure blocks G0.
+
+For a failure, the Factory stores the adapter's category and non-empty evidence text and computes
+a version-1 fingerprint as follows:
+
+1. Replace CRLF and lone CR with LF.
+2. Replace exact occurrences of the absolute worktree root in native path spelling with
+   `<WORKTREE>`. Do not normalize other paths, whitespace, values, messages, stack frames, or text.
+3. Encode the resulting text as UTF-8 and calculate SHA-256. Store the original evidence, normalized
+   evidence, version, and hash. IDs and categories are compared separately, not folded into the
+   text hash.
+
+The human approval records a unique approval ID, job and baseline attempt IDs, baseline report
+hash, candidate SHA, environment identity hash, test ID, category, fingerprint version/hash,
+reason, timestamp, and local actor. The actor is a declared local identity, not strong
+authentication. Missing identity or reason blocks approval.
+
+For a later Slice or final Gate, an approval applies only if that test was actually executed in
+that attempt, all binding hashes and the environment identity match, and its ID, category, and
+versioned fingerprint match. Any other failure, absent evidence, ambiguous ID, changed fingerprint,
+or changed environment blocks automatic acceptance. A changed failure fingerprint cannot be
+approved as an exception in this job: fix the failure and explicitly run Gate again. An excepted
+test outside the selected slice checks is not represented as executed or as an active exception in
+that slice.
+
+An observed PASS invalidates the approval for later recurrence; persist that invalidation when the
+result is consumed. If the test later fails again with the original fingerprint, it needs a fresh
+human approval referencing both the original baseline and the new failed attempt. The failed
+attempt remains FAIL; a person must explicitly request another Gate. A changed fingerprint remains
+ineligible. An approval never rewrites the baseline or current test result. Equal fingerprints
+are a conservative matching rule, not proof of equal cause: an unnoticed new cause with identical
+evidence remains an explicitly accepted risk.
+
+### 5.3 Comparing baseline and final discovery
+
+The baseline preserves every discovered test ID and its actual outcome. The final full attempt
+compares its discovery with the accepted baseline inventory and reports additions, retained IDs,
+and missing IDs. A missing original ID blocks the attempt; it is not automatically considered
+passed or covered by an exception.
+
+A person may separately review a rename or intentional retirement of a non-required baseline
+test. The decision identifies the old ID, optional replacement ID, reason, actor, baseline binding,
+and scope/spec revision. It must not claim the old test executed or waive a required check or AC.
+Changing a required verification is outside this contract and requires a separately approved scope
+or spec amendment before proceeding. Record the old ID as not executed and separately retired;
+any replacement must actually execute. Preserve the failed attempt and explicitly request a new
+final Gate after the decision. An unreviewed disappearance always blocks progress.
+
+## 6. Specification, Test Author, G1, and checkpoint
+
+### 6.1 Spec and feature ownership
+
+The new-workflow spec has one `## Acceptance Criteria` section. It contains feature headings
+`### <feature-id>` and single-line bullets `- AC-001: observable behavior`. Feature IDs use
+`[A-Za-z0-9][A-Za-z0-9._-]*`; AC IDs use `AC-[0-9]{3,}` and are unique within the job. Each AC
+belongs to exactly one feature and is automatable. Reject empty, duplicated, malformed, or
+unmapped criteria. A non-automatable requirement must be separately approved outside automated
+Gate; manual verification is never an automated AC PASS.
+
+G0 explicitly approves the exact spec, feature/AC ownership, scope, and test-path scope against the
+accepted baseline disposition and environment identity. Scope input is a factory-owned JSON
+artifact with exactly `schema_version: 2`, non-empty `allowed_paths`, and non-empty
+`test_paths` arrays using the existing safe glob rules. Every concrete candidate test path must
+match both arrays; hard protected Factory/config paths cannot be overridden. G0 stores and hashes
+the exact scope input and spec. Persist their hashes and actor. If the accepted
+baseline changes after G0, preserve the old approval but mark it invalid and require a new G0.
+G0 is durable even if the automatically launched Test Author subsequently fails; the command
+reports that failure and the job awaits human action.
+
+### 6.2 Candidate and G1
+
+After G0, the orchestrator starts one automatic Test Author session using a configured dedicated
+profile. The agent receives the approved spec, conventions, and test-path scope. A different model
+family is optional. Do not grant the profile direct commit or push permission. Post-run checks
+must detect HEAD changes and out-of-scope writes, but cannot undo a push or provide OS isolation;
+do not claim that tool-denial settings alone guarantee prevention of indirect commands.
+
+For this first version Test Author may create only new test files, not modify or delete existing
+files. Candidate paths must be regular non-symlink files under approved test paths, absent from
+`job_base_sha`, safe repository-relative POSIX paths, and distinct from protected Factory/config
+paths. A broad protected test glob may be overridden only for the exact new paths approved at G1.
+The complete tracked and non-ignored untracked diff, excluding only the Factory-owned untracked
+`.factory/task.md` runtime input, must consist exactly of candidate test paths. HEAD must remain
+`job_base_sha`. Any unexpected commit, path, staged change, or file type stops and preserves work.
+The task file must be absent before the session and removed only if it is still the exact
+Factory-created content; otherwise stop for human review.
+
+The final agent response is strict JSON:
 
 ```json
 {
   "schema_version": 2,
   "tests": [
     {
-      "id": "profile-save-roundtrip",
-      "path": "tests/profile/test_save.py",
+      "id": "tests/test_profile.py::test_save",
+      "path": "tests/test_profile.py",
       "acceptance_criteria": ["AC-001"]
     }
   ]
 }
 ```
 
-The orchestrator computes file hashes and adds them to the approved `tests.json`; it does not trust
-hashes supplied by the agent.
+IDs are unique stable runner selectors. Each test maps to one or more ACs of the same feature;
+every gating AC maps to at least one test. Multiple test IDs may share one new file. Reject
+unknown ACs, unsafe paths, duplicates, empty lists, extra fields, and files absent from the complete
+candidate diff. The orchestrator computes each file's SHA-256 and stores the normalized manifest as
+an immutable Factory-owned artifact. The human reviews the exact diff, manifest, mappings, and
+hashes and approves them at G1. The stored manifest has the same schema with an additional
+`sha256` field on each test, computed from the exact file bytes; IDs sharing a path must carry the
+same file hash. G1 is bound to the manifest hash, paths, content hashes, G0 revision, and baseline.
+A changed candidate invalidates G1.
 
-The job sequence is:
+### 6.3 Baseline-red and checkpoint
 
-1. A person prepares the branch. Factory attaches a clean worktree before G0, checks the repository,
-   worktree, dependencies and environment, records `job_base_sha`, and discovers test conventions.
-2. Factory runs initial baseline against the unchanged project. A failure blocks the workflow until
-   it is fixed and a new baseline passes, or a person approves an eligible exception.
-3. A person approves the specification, gating ACs, and scope at G0.
-4. Factory automatically starts Test Author in a separate session/profile. It writes candidate
-   tests only within the approved project test paths.
-5. Orchestrator validates the complete diff and creates a candidate manifest.
-6. Human G1 approves the exact manifest, paths, AC mapping, and test content.
-7. Factory runs baseline-red against `job_base_sha`. Invalid setup, syntax, imports, or reports do
-   not count as expected red.
-8. Orchestrator commits only the approved test paths, verifies the commit, and records
-   `gate_base_sha`.
-9. Builder works in one session per approved slice. Slice Gate runs after each; final Gate runs once.
-10. Review uses the complete diff from `job_base_sha`; a human publishes after review.
+After G1, run the approved adapter in `red` mode. Check HEAD is `job_base_sha` and the complete
+worktree diff contains only the exact approved new test files with matching hashes, before and
+after the run. The report binds the request, manifest, and SHA and has exactly one result per
+registered test, all `ASSERTION_FAILURE`. PASS, ERROR, missing/duplicate test, setup/import/syntax
+failure, invalid report, or changed inputs blocks the checkpoint. The trusted adapter is
+responsible for classifying failures; a SHA in its report alone does not prove execution.
 
-Any manifest/content change after G1 invalidates that approval and requires a new G1 and
-baseline-red result. A failed stage preserves work and evidence and stops before Builder starts.
+After successful red, the orchestrator writes checkpoint intent, stages and commits only the
+approved paths, verifies that the commit has exactly `job_base_sha` as its sole parent and exactly
+those changed paths and approved bytes, and records the full commit SHA as `gate_base_sha`.
+Unexpected staged or unstaged changes, paths, parents, content, or HEAD fail closed. No reset,
+force, or automatic deletion of commits is allowed. Persist the verified checkpoint event and
+artifact hashes before initializer or Builder starts. Review uses the complete diff from
+`job_base_sha`; implementation Gate uses `gate_base_sha`.
 
-## 2A. Initial baseline and exceptions
+The existing initializer and human plan approval still follow checkpoint and precede Builder.
+Its setup commit remains separate from the test-only checkpoint. Scope and protected-path
+requirements apply, and its pinned script must be verified before execution. New-workflow
+initializer and Builder cannot start without the durable verified checkpoint.
 
-### Preflight and discovery
+### 6.4 Feature, slice, and AC mapping
 
-Preflight verifies that the attached branch and worktree are usable and that the required
-environment and configured checks are available. Discovery records the project's test structure,
-test commands and CI conventions as available. Discovery is informational: Factory must not invent
-or execute guessed commands, install dependencies, or modify project configuration or CI. The
-initial baseline executes the trusted project checks contract; if no usable checks contract or
-test infrastructure exists, stop and propose a separately approved setup.
+The plan contains ordered features and slices. Each feature references its own AC IDs. Each slice
+references the ACs it contributes to and the registered Test Author test IDs that verify that
+step; a slice need not complete an AC. Each registered test belongs to exactly one slice of its
+feature. Each AC must be referenced by at least one slice and covered by at least one registered
+test. Reject cross-feature, unknown, missing, or duplicate mappings.
 
-Run the existing full project checks at the exact recorded candidate SHA, before Test Author or
-other feature changes. Check for tracked and untracked non-ignored changes before and after the
-run; a dirty or changed worktree or changed HEAD invalidates the attempt and preserves evidence.
-This is not an OS sandbox and does not prove that ignored files or external services were untouched.
-Record the precise invocation, SHA, relevant environment/tool identities, check results, timestamps,
-and stdout/stderr artifacts. A valid passing report establishes the initial baseline; it does not
-prove that later failures have the same or a different cause.
+The v2 plan has exactly `schema_version: 2` and a non-empty `features` array. Each feature has
+`id`, `title`, `acceptance_criteria` (its AC IDs), and non-empty `slices`. Each slice has unique
+`id`, `goal`, non-empty exact `paths`, non-empty `acceptance_criteria`, and non-empty `test_ids`.
+Slice paths must be within job scope and follow the existing safe path rules. Feature and AC sets
+must match G0 exactly. A slice's tests must map only to ACs referenced by that slice. The human
+approves the plan and initializer script, and their hashes are journaled before Builder starts.
 
-If a baseline fails, preserve the attempt and block G0 and subsequent work. A person may repair
-the project outside Factory's feature changes, after which Factory must record the actual new
-starting SHA and run a new baseline. Alternatively, a person may approve specific eligible
-pre-existing test failures as exceptions. The failed baseline is never rewritten as PASS.
+Slice Gate reports the current slice and its test results, not an overall AC PASS. After all
+slices in all features pass, one final full Gate evaluates all mapped tests of every AC, grouped
+by feature. An AC is PASS only if all its mapped required tests ran and passed; otherwise use
+`FAIL`, `MISSING_TEST`, `SKIPPED`, or `NOT_EXECUTED`. The final Gate runs all project tests,
+including Builder-added tests through normal discovery.
 
-### Exception eligibility and approval
+## 7. Gate report v2 and verdicts
 
-An exception may cover only an individually identified existing project test observed failing in
-the initial baseline. It cannot cover a whole suite, a new acceptance test, a missing or skipped
-test, a setup/import/syntax failure, an invalid or missing report, an interrupted check, or a
-scope, protected-path, integrity, or security failure. Required ACs still need passing automated
-evidence; an exception cannot make an AC pass.
-
-The checks adapter must report executed test IDs and individual outcomes with sufficient
-failure evidence to compare the approved baseline failure to each subsequent occurrence. A
-check-level aggregate alone is insufficient for an exception. If the adapter cannot provide
-reliable per-test evidence, Factory must block and ask for human repair or improved reporting;
-it must not infer the result from a process exit code or blanket-waive the suite. A v1 target
-report can still support an unqualified baseline PASS where its existing contract is satisfied.
-The exact versioned target-checks per-test report schema and failure-comparison algorithm are
-open design items; they require approval before implementing exception handling. In particular,
-matching a test ID or failure text is evidence, not proof of an unchanged root cause.
-
-Each G1-independent exception approval is an explicit human action, persisted in the job journal
-and bound to the baseline attempt/report hash, initial SHA, exact test ID, recorded failure
-evidence, reason, and approval identity or equivalent auditable actor. It authorizes only the
-documented failure for this job; it does not change the recorded test result or the approved spec.
-Each later Gate that executes the excepted test must validate the approval, check the actual
-execution outcome and compare its failure evidence. Changed or ambiguous failure evidence,
-missing required execution, or additional failures block progress pending human review. If the
-previously failing test passes, report it as PASS rather than as an active exception; a later
-recurrence requires fresh human review.
-
-Approved exceptions apply to the initial baseline and to a Slice Gate or final Gate only when that
-specific existing test is actually executed and its failure is eligible. Tests outside the
-selected slice's applicable checks are not treated as missing exception results. A valid slice or
-final attempt with at least one such failure and no other failure yields `PASS_WITH_EXCEPTION`,
-not PASS. A slice with that verdict may advance, and a final Gate with that verdict may enter
-review, with the exception prominently disclosed. No exception may conceal an unexecuted required
-check or new failure.
-
-The initial baseline report is written before any exception can be approved and remains immutable
-with its actual FAIL. Once all eligible failures are explicitly approved, Factory records a
-separate durable baseline disposition of `PASS_WITH_EXCEPTION` referencing that report and the
-approvals. G0 may proceed only after this disposition is validated; Factory does not rewrite the
-report or rerun checks merely to manufacture a qualified result.
-
-## 3. AC and test manifest contracts
-
-### 3.1 Acceptance Criteria
-
-The approved `spec.md` has one `## Acceptance Criteria` section. Each gating criterion is a
-single-line bullet in this form:
-
-```markdown
-- AC-001: A user can save a valid profile and retrieve the same values.
-```
-
-IDs match `AC-[0-9]{3,}`, are unique within the approved spec, and remain stable across amend
-revisions where the behavior is unchanged. Every gating AC must be automatable. Human-only checks
-are outside this automated Gate contract and cannot satisfy an AC PASS.
-
-### 3.2 Registered Test Author manifest
-
-The factory-owned `jobs/<job-id>/tests.json` uses schema version 2:
-
-```json
-{
-  "schema_version": 2,
-  "tests": [
-    {
-      "id": "profile-save-roundtrip",
-      "path": "tests/profile/test_save.py",
-      "acceptance_criteria": ["AC-001"],
-      "sha256": "64-lowercase-hex-characters"
-    }
-  ]
-}
-```
-
-Validation rules:
-
-- Test IDs are unique, non-empty stable identifiers.
-- Paths are normalized repository-relative paths, stay within the approved test scope, and do
-  not traverse symlinks or escape the worktree.
-- Each Test Author test maps to one or more known AC IDs. Every gating AC maps to at least one
-  Test Author test.
-- Candidate hashes are computed by the orchestrator from exact worktree bytes before G1 so the
-  human approves the precise content. Recompute and compare them after G1 and before checkpoint.
-  The manifest is stored outside the Builder-writable worktree.
-- The manifest contains only the approved independent Test Author set. Builder-authored tests are
-  ordinary project tests; they do not replace or rewrite this manifest.
-- M1 schema-v1 manifests remain readable by the existing M1 path. Do not silently upgrade or
-  reinterpret them.
-
-The existing slice plan assigns each registered Test Author test ID to exactly one slice. Slice
-Gate reports only ACs exercised by that slice; final Feature Validation reports every gating AC.
-Project checks must include ordinary Builder-authored tests through the project's standard
-discovery in `--fast`/`--full`. Slice `--fast` must also run the applicable existing regression
-checks while excluding pending job tests; the selected slice tests must still run. Factory must
-not claim those regression checks ran when the target adapter cannot establish that they did.
-Builder test additions still obey the approved scope and hard protected-path policy.
-
-## 4. G1, baseline-red, and checkpoint
-
-### G1 and Test Author scope
-
-The Test Author receives the approved spec, project conventions, and approved test-path scope. A
-separate session/profile is mandatory; a different model family is optional. The Test Author has
-no commit or push authority.
-
-After the session, the orchestrator compares the complete worktree against `job_base_sha`.
-Only declared test-path changes are candidates. Any other change fails closed and is preserved for
-human review. This is post-run enforcement, not an OS sandbox.
-
-G1 approves the exact candidate diff and AC mapping. The approval is bound to the manifest content
-hash and test paths. It may authorize additions or updates only at those exact test paths; deleting
-an existing test file is rejected. A broad protected glob may be overridden only for these exact
-G1-approved paths during this phase; G1 does not authorize changes to any other protected path or
-a general bypass of `.factory/protected.txt`. After checkpoint, the Test Author file hashes are
-immutable for the Builder.
-
-### Baseline-red
-
-Use the existing target-checks red invocation:
-
-```text
-.factory/checks.py --red --manifest PATH --baseline-sha <job_base_sha>
-```
-
-The report must bind to the exact manifest hash and `job_base_sha`, contain exactly one result per
-registered test, and classify each expected failure as an assertion/behavior failure. A passing
-test, syntax/import/setup failure, missing result, malformed report, or unexpected test ID blocks
-the checkpoint. Baseline-red is input readiness, not a Gate mode or verdict.
-
-### Test-only checkpoint
-
-After G1 and successful baseline-red, the orchestrator—not the Test Author—creates one commit
-containing only the approved Test Author test paths. It must:
-
-1. stage and commit the exact approved path list, never the whole worktree;
-2. verify the commit's changed paths and content hashes against G1;
-3. record the resulting full commit SHA as `gate_base_sha`;
-4. persist the manifest, G1 evidence, baseline-red report, checkpoint SHA, and journal event before
-   starting Builder.
-
-A crash before the checkpoint event is durable must be recoverable by inspecting Git and the
-journal. If the commit cannot be proven to contain exactly the approved test content, fail closed
-and require human repair; never reset or delete the commit automatically.
-
-The implementation may reuse the orchestrator-only, exact-path commit precedent in
-`factory/job.py`. The Test Author itself must never create the checkpoint.
-
-## 5. SHA roles and Gate invocation
-
-New-workflow jobs and their reports distinguish:
-
-- `job_base_sha`: the accepted starting SHA after baseline or approved exception disposition
-  (`work_branch_start_sha` in existing M1 records). It anchors audit, Test Author validation, and
-  the complete review/PR diff; earlier rejected baseline attempts retain their own SHA.
-- `gate_base_sha`: approved Test Author checkpoint; unavailable until that checkpoint is verified.
-  When represented for manual M1 jobs it equals `job_base_sha`.
-- `comparison_base_sha`: the explicit base passed to one Gate attempt. For a slice, this is the
-  commit immediately before that slice; for final validation, it is `gate_base_sha`.
-- `head_sha`: exact committed HEAD evaluated by that Gate attempt. For the initial baseline it
-  equals `job_base_sha`.
-
-This draft proposes that the orchestrator invoke initial baseline automatically, with no new
-user-facing `baseline` Gate CLI mode. The existing Gate CLI remains
-`factory job gate JOB_ID --base SHA --mode fast|full [--slice ID]`. For the earlier Chapter 3/4
-proposal of a separate baseline check excluding pending tests, this draft instead requires slice
-`--fast` to execute applicable regression checks without pending tests, as specified above. The
-initial baseline and this slice requirement serve different purposes; neither is baseline-red.
-This replacement needs explicit approval because it changes the approved Chapter 3/4 contract.
-
-The Test Author baseline-red check remains a separate target-checks invocation. For each slice or
-final Gate attempt, the orchestrator supplies the proper `comparison_base_sha` as `--base`; the
-report also retains the fixed `job_base_sha` and `gate_base_sha`.
-
-The full review diff starts at `job_base_sha`, so it includes the Test Author checkpoint. Gate
-scope for implementation starts at `gate_base_sha`.
-
-## 6. Gate report schema v2
-
-Each initial baseline, slice, or final attempt writes an immutable report and logs under
-`jobs/<job-id>/gate/<attempt-id>/`. The example shows a slice after all inputs exist:
+Each initial baseline, slice, and final attempt has a unique immutable directory
+`jobs/<job-id>/gate/<attempt-id>/` containing the request, adapter stdout/stderr, environment
+identity, and Factory `gate-report.json`. The report has:
 
 ```json
 {
   "schema_version": 2,
   "gate_type": "slice",
   "job_id": "job-id",
+  "attempt_id": "attempt-id",
   "feature_ids": ["feature-1"],
   "slice_id": "slice-1",
-  "job_base_sha": "full-sha",
-  "gate_base_sha": "full-sha",
-  "comparison_base_sha": "full-sha",
-  "head_sha": "full-sha",
-  "started_at": "RFC3339 timestamp",
-  "completed_at": "RFC3339 timestamp",
+  "candidate_sha": null,
+  "job_base_sha": "full-commit-sha",
+  "gate_base_sha": "full-commit-sha",
+  "comparison_base_sha": "full-commit-sha",
+  "head_sha": "full-commit-sha",
+  "started_at": "RFC3339 UTC timestamp",
+  "completed_at": "RFC3339 UTC timestamp",
   "duration_ms": 1234,
-  "checks": [
-    {
-      "id": "slice-tests",
-      "required": true,
-      "status": "PASS",
-      "exit_code": 0,
-      "log_path": "checks.stdout.txt"
-    }
-  ],
-  "acceptance_criteria": [
-    {
-      "id": "AC-001",
-      "status": "PASS",
-      "test_ids": ["profile-save-roundtrip"]
-    }
-  ],
   "inputs": {
-    "spec_sha256": "64-lowercase-hex-characters",
-    "tests_sha256": "64-lowercase-hex-characters",
-    "slice_plan_sha256": "64-lowercase-hex-characters",
-    "scope_sha256": "64-lowercase-hex-characters"
+    "spec_sha256": "64-lowercase-hex",
+    "tests_sha256": "64-lowercase-hex",
+    "slice_plan_sha256": "64-lowercase-hex",
+    "scope_sha256": "64-lowercase-hex",
+    "adapter_sha256": "64-lowercase-hex",
+    "environment_sha256": "64-lowercase-hex",
+    "request_sha256": "64-lowercase-hex"
   },
-  "tests": {"executed_ids": ["profile-save-roundtrip"]},
+  "checks": [{"id": "fast", "kind": "test", "required": true, "status": "PASS", "exit_code": 0}],
+  "tests": [{"id": "tests/test_profile.py::test_save", "check_id": "fast", "outcome": "PASS", "failure": null}],
+  "acceptance_criteria": [],
   "exceptions": [],
+  "baseline_comparison": null,
+  "scope": {"changed_paths": [], "violations": []},
+  "protected_paths": {"violations": []},
+  "logs": {"stdout": "checks.stdout.txt", "stderr": "checks.stderr.txt"},
   "risk": {"status": "DEFERRED"},
   "verdict": "PASS"
 }
 ```
 
-Allowed `gate_type` values are `initial_baseline`, `slice`, and `feature_validation`. Initial
-baseline precedes G0, so its `feature_ids` and `acceptance_criteria` are empty, `slice_id` and
-`gate_base_sha` are null, and the four not-yet-approved input hashes in `inputs` are null. Its
-`comparison_base_sha` and `head_sha` equal `job_base_sha`. It records the baseline invocation and
-environment identities as additional evidence; their exact schema is an open item. Slice reports
-include the selected slice's applicable ACs; final reports include all gating ACs and use
-`slice_id: null`. The initial failed attempt keeps `verdict: "FAIL"`; the separate, later
-baseline disposition records `PASS_WITH_EXCEPTION` after approval.
+The example shows one passing slice; actual `checks` and `tests` include all applicable results.
+`gate_type` is `initial_baseline`, `slice`, or `feature_validation`. For an initial baseline,
+`candidate_sha`, `comparison_base_sha`, and `head_sha` are equal; `job_base_sha`, `gate_base_sha`,
+`slice_id`, and not-yet-approved input hashes are null, and feature and AC lists are empty. The
+separate disposition records the accepted `job_base_sha`. For a slice, `comparison_base_sha` is
+the verified commit immediately before it, and `head_sha` is the committed slice head. For final
+Gate, the comparison base is `gate_base_sha` and `head_sha` is the tested committed head.
 
-Check statuses are `PASS`, `FAIL`, `SKIPPED`, `NOT_EXECUTED`, or `WARNING`; `WARNING` is valid only
-for an explicitly optional check. AC statuses are `PASS`, `FAIL`, `MISSING_TEST`, `SKIPPED`, or
-`NOT_EXECUTED`. The `exceptions` array is empty for an unqualified PASS. Otherwise, each entry
-must identify the human approval, original baseline attempt and report hash, test ID, baseline and
-current failure evidence, and links to the relevant logs. The corresponding check/test result
-remains visibly FAIL; an exception is never represented as a passing test.
+The report includes the validated adapter outcomes, actual check exit codes, hashes, log references,
+and scope/protected-path assessment. `baseline_comparison` is null except for final Gate, where it
+lists added, retained, missing, and explicitly retired IDs and approval references. Each final AC
+entry has `feature_id`, `id`, `status`, and mapped `test_ids`. The `exceptions` list contains each
+active approval ID, test ID, initial attempt/report hash, both evidence fingerprints, and log
+references. Entries are unique. Test outcomes remain their actual values.
 
-The overall verdict is:
+The final `baseline_comparison` object has `added_ids`, `retained_ids`, `missing_ids`, and
+`retired` arrays. Each retired entry has `id`, nullable `replacement_id`, and `approval_id`.
+Missing IDs remain listed even if retired. Each exception entry has `approval_id`, `test_id`,
+`baseline_attempt_id`, `baseline_report_sha256`, `baseline_fingerprint_sha256`,
+`current_fingerprint_sha256`, `baseline_log_path`, and `current_log_path`. Logs are safe relative
+artifact paths. Scope objects list normalized changed paths and violations; for baseline their
+arrays are empty only after the clean worktree checks. A failed preflight records an explicit
+diagnostic and never presents missing checks as executed.
 
-- `PASS`: all required checks and applicable ACs pass, and no active exception is needed.
-- `PASS_WITH_EXCEPTION`: all otherwise-required evidence is valid, every applicable AC passes,
-  scope/protected-path and integrity checks pass, and every remaining failure is an executed,
-  individually approved and matching pre-existing test failure listed in `exceptions`.
-- `FAIL`: any other required check fails or is missing, skipped, unexecuted, malformed,
-  inconsistent, or not demonstrably covered by a valid exception.
+Overall verdict:
 
-Project checks must provide enough structured evidence to distinguish expected failed test
-results from infrastructure or process errors. An exit code is recorded and validated against
-that report; a nonzero exit alone is neither a PASS nor sufficient evidence for an exception.
-The exact target adapter and process-exit contract for qualified exceptions is an open item. Do
-not derive a verdict from an agent claim or from process exit code alone.
+- `PASS`: every required check and applicable final AC passed, all required tests executed, and no
+  exception is active.
+- `PASS_WITH_EXCEPTION`: all scope, integrity, execution, build, and applicable AC requirements
+  pass; every remaining actual test failure is an executed, approved and matching pre-existing
+  failure, and every active exception is disclosed. There must be at least one active exception.
+- `FAIL`: any other required failure, missing/skipped/unexecuted check or test, missing AC,
+  changed/ambiguous evidence, invalid report, timeout, or inconsistent input.
 
-## 7. Journal, recovery, and failure behavior
+An aggregate project test check may remain visibly `FAIL` in a qualified report only when the
+adapter has completed normally and its complete per-test evidence proves that every failure in
+that check is covered. Build and other required checks cannot be waived. Optional `WARNING` may
+appear only for an explicitly optional check and never replaces an incomplete required check.
 
-- Keep state transitions under the existing orchestrator. Gate remains state-neutral.
-- Record workflow version, initial baseline attempts and environment, human exception approvals,
-  Test Author start/completion, G1 approval hash, baseline-red report reference, checkpoint SHA,
-  and Gate report references in durable job events/snapshots. Do not store approval only in an
-  ephemeral session transcript.
-- A new-workflow Builder cannot start unless the job has a valid baseline or approved exceptions,
-  valid approved manifest, successful baseline-red evidence, and verified `gate_base_sha`.
-- Automatically invoke Test Author only once after G0; a start without a durable completion
-  is interrupted, not successful. Preserve its work and require human intervention rather than
-  starting another session automatically.
-- An interrupted initial baseline is not a successful attempt. Preserve its artifacts and require
-  explicit continuation; do not infer a verdict from a partial report.
-- Before each slice and final Gate, verify approved Test Author file hashes. Any mismatch fails
-  closed before project checks execute.
-- If the report is missing, malformed, or has inconsistent SHAs/hashes, the attempt fails and
-  review is blocked.
-- Preserve failed work, logs, manifests, and reports. Recovery may complete a provable interrupted
-  journal/write operation, but must not rerun an agent, rewrite approvals, or discard a commit.
-- Chapter 4/M1 remains retry-free. New-workflow failures stop and require human action; an
-  explicitly requested new baseline after repair is not an automatic retry loop.
+For new-workflow CLI Gate results, exit `0` for `PASS` and `PASS_WITH_EXCEPTION`, and `1` for
+`FAIL`; malformed invocation/configuration retains exit `2`. JSON always discloses the precise
+verdict and exceptions. Gate stays state-neutral. The orchestrator records the report path and
+hash and accepts either passing verdict for slice progression or final review; it must never
+rewrite `PASS_WITH_EXCEPTION` as `PASS`. Before and after each Gate, verify the expected committed
+HEAD and locked Test Author hashes. A changed HEAD or worktree invalidates the attempt.
 
-## 8. Required validation
+## 8. Journal, states, and recovery
 
-### Unit and contract tests
+`events.jsonl` remains authoritative; snapshots and progress are projections. Each new event has
+the existing sequence, UTC timestamp, job ID, actor, reason, and reconstructible job data, plus
+the following event-specific fields. Paths are job-relative regular non-symlink artifacts, and
+each referenced immutable artifact is bound by SHA-256:
 
-- Verify pre-spec worktree attachment and automatic baseline/Test Author apply only to new-workflow
-  jobs; existing M1 event replay and transitions remain unchanged.
-- Reject dirty or changed worktrees, changed SHA/environment, missing checks, interrupted baseline,
-  malformed reports, and guesses about test commands.
-- Reject blanket exceptions, unknown test IDs, changed failure evidence, wrong baseline/report
-  binding, unapproved or stale exceptions, new test failures, and non-waivable errors.
-- Verify actual test FAIL remains visible, `PASS_WITH_EXCEPTION` lists every active exception, and
-  unexecuted required checks or ACs cannot be waived.
-- Reject duplicate/malformed AC IDs, unknown AC references, missing Test Author coverage, duplicate
-  test IDs, unsafe paths, symlink escapes, and hash mismatches.
-- Reject G1 evidence bound to a different manifest or path set.
-- Reject baseline-red success without an expected assertion/behavior failure for every test.
-- Reject checkpoint commits containing any unapproved path or mismatched content.
-- Validate all report v2 gate types, early nullable inputs, enums, SHA/hash consistency, applicable
-  AC coverage, and verdict derivation. Preserve v1 report compatibility without rewriting records.
+| Event | Required event-specific fields |
+|---|---|
+| `BASELINE_STARTED` | attempt ID, candidate SHA, adapter/config hashes, environment hash, request hash |
+| `BASELINE_COMPLETED` | attempt ID, candidate SHA, report path/hash, actual verdict |
+| `EXCEPTION_APPROVED` | approval ID and all baseline/test/evidence/actor bindings in section 5.2 |
+| `EXCEPTION_INVALIDATED` | approval ID, observed PASS attempt/report hash, test ID |
+| `BASELINE_ACCEPTED` | attempt ID, report hash, candidate SHA, `PASS` or `PASS_WITH_EXCEPTION`, approval IDs |
+| `G0_APPROVED` | spec/scope hashes, baseline disposition reference, SHA, environment hash, actor |
+| `TEST_AUTHOR_STARTED` | run ID, G0 reference, base SHA, profile, immutable task hash |
+| `TEST_AUTHOR_COMPLETED` | run ID, outcome, run artifact references/hashes, candidate manifest hash if valid |
+| `G1_APPROVED` | G0 reference, candidate manifest/diff hashes, approved path/content hashes, actor |
+| `RED_COMPLETED` | attempt ID, G1 reference, request/report hashes, base SHA, actual outcome |
+| `CHECKPOINT_STARTED` | G1/red references, parent SHA, exact paths and content hashes |
+| `CHECKPOINT_COMPLETED` | intent reference, verified checkpoint SHA, parent SHA, path/content hashes |
+| `TEST_RETIREMENT_APPROVED` | baseline report hash, old ID, optional replacement ID, reason, actor, scope/spec revision |
+| `GATE_REVIEW_APPROVED` | gate stage, nullable slice ID, exhausted batch and attempt IDs, reason, actor |
+| Slice/final Gate events | attempt ID, report path/hash, exact bases/head, actual verdict and active approval IDs |
 
-### Temporary-Git integration tests
+All IDs are unique in their scope; events are appended and fsynced under the existing job lock
+before projections or dependent work. Replay validates workflow version, event order, references,
+hashes, legal state, and verdicts. Unknown, contradictory, incomplete, or altered evidence fails
+closed. A partial journal tail is not silently discarded.
 
-- Complete clean initial baseline → G0 → automatic Test Author → G1 → baseline-red → exact
-  test-only commit → slice Gate → final Gate, including a job with multiple features.
-- Verify failing initial baseline blocks G0; after human-approved eligible exception, verify the
-  matching failure is disclosed in applicable slice and final reports. Verify an additional or
-  changed failure blocks advancement.
-- Verify repair and a new baseline bind evidence to the actual new `job_base_sha`.
-- Confirm final review diff uses `job_base_sha`, while implementation Gate uses `gate_base_sha`.
-- Simulate interruption before/after checkpoint commit and before/after journal persistence; ensure
-  recovery neither duplicates nor drops the checkpoint.
-- Mutate a locked Test Author test, add an out-of-scope file, forge a report, omit a required AC,
-  and interrupt a check process; every case must block Builder progression or review as
-  appropriate and preserve evidence.
-- Confirm manual M1 jobs and their existing v1 records follow the unchanged path.
+For workflow v2:
 
-## 9. Implementation order
+| State/condition | Allowed forward operation |
+|---|---|
+| `DRAFT_SPEC`, no worktree | Attach existing branch; start automatic baseline when adapter is approved |
+| `DRAFT_SPEC`, accepted baseline | Human G0; persist approval and enter `SPEC_APPROVED`; start Test Author automatically |
+| `SPEC_APPROVED`, invalidated G0 before Test Author | Explicit new baseline, then fresh G0; start Test Author only after approval |
+| `SPEC_APPROVED`, valid completed candidate | Human G1; persist manifest and enter `TESTS_WRITTEN` |
+| `TESTS_WRITTEN`, approved G1 | Run red; on success enter `TESTS_RED_OK`, then create and verify checkpoint |
+| `TESTS_RED_OK`, verified checkpoint | Initialize and approve plan/init script; enter `BUILDING` |
+| `BUILDING` | Commit and Gate each slice; record a slice passed only on a valid passing verdict |
+| `BUILDING`, all slices passed | Enter `GATE`; run one final full Gate |
+| `GATE`, passing final Gate | Enter `REVIEW`, retaining the exact verdict and evidence |
 
-1. Define and approve the open items in section 10; reconcile the approved earlier contracts and
-   decision register before coding.
-2. Add durable new-job workflow selection, backward-compatible replay, and pre-G0 attachment.
-3. Add preflight/discovery, initial baseline evidence and recovery, then explicit exception
-   approval and fail-closed matching.
-4. Define AC parsing, manifest v2, G1 evidence, and hash validation.
-5. Add automatic Test Author invocation and post-run scope enforcement.
-6. Add checkpoint creation, journaling, and crash recovery.
-7. Add Gate report v2, exception-aware slice/final verdicts, and SHA roles; ensure slice `--fast`
-   executes applicable regression checks without pending tests.
-8. Add focused unit and temporary-Git integration coverage at each step.
-9. Verify existing M1 behavior remains unchanged; do not add automatic retries, risk routing,
-   automatic CI changes, or push.
+Failures preserve evidence and stop or escalate to `NEEDS_HUMAN`; resume restores the prior state
+only after its prerequisites are revalidated. A new accepted baseline after G0 invalidates that
+G0 and requires a fresh G0 approval event before Test Author; earlier events are not overwritten.
+An interrupted baseline is not successful and requires an explicit new attempt. A valid report
+without its event may be finalized only if all attempt inputs and outputs are provably identical;
+otherwise stop, never infer success from a partial artifact.
 
-## 10. Open items before implementation
+An interrupted or failed Test Author does not trigger an automatic retry. Preserve its logs and
+failed run record. For an explicit human-requested restart, the person reviews the worktree and
+confirms exactly which new Test Author files to discard. Factory may remove only listed, regular,
+new files under approved test scope whose paths and hashes still match the reviewed snapshot; it
+must not remove pre-existing, changed, ambiguous, or out-of-scope files. A clean initial snapshot
+and matching hashes do not independently prove who wrote a file; if ownership is uncertain, stop
+for manual resolution. Never reset Git or silently remove commits. Once the worktree is clean and
+the same baseline, G0, and environment remain valid, start a new session only on explicit request.
+The original automatic invocation occurs once per G0; later sessions require explicit action.
 
-The workflow and outcome direction above is not sufficient to implement the exception safely.
-Resolve and approve these details, together with the proposed earlier-contract amendments, before
-starting code:
+For checkpoint recovery, a durable intent and unchanged parent with no commit permit explicit
+continuation. If a single existing commit can be proven to have the intended sole parent, exact
+paths, and approved content, recovery may append the missing completion event without another
+commit. Otherwise stop for human repair. A durable completion must be revalidated before use.
+Slice and final Gate recovery must preserve existing M1 behavior on the M1 path; for v2 it must
+never replay an agent automatically or infer a passing Gate from missing or inconsistent evidence.
 
-1. The versioned target-checks report schema for per-test execution and failure evidence; how
-   process exit codes and mixed approved/unapproved failures are interpreted.
-2. The deterministic comparison and re-approval rules for a recurring failure, including what
-   evidence is sufficiently stable and what environmental changes invalidate it.
-3. The exact CLI/interaction for a person to approve an exception, request a new baseline after
-   repair, and continue after an interruption; how approval identity is recorded.
-4. The baseline invocation/environment artifact schema, and how pre-G0 discovery identifies a
-   trusted checks contract without changing or guessing project commands.
-5. The precise proof that slice `--fast` executed applicable regressions and excluded pending job
-   tests, including the target adapter's contract and failure behavior when it cannot prove this.
+For v2, each slice and the final Gate have separate batches of at most three attempted Gate runs,
+including the initial attempt. A failed, errored, or interrupted started attempt consumes one
+slot; replaying its durable result does not consume another. `PASS` and `PASS_WITH_EXCEPTION`
+complete that stage. After three non-passing attempts, the orchestrator blocks further attempts
+for that stage until a person reviews the evidence and explicitly records `GATE_REVIEW_APPROVED`
+with a reason. That approval opens one new batch of up to three explicitly requested attempts.
+The cap applies to workflow progression attempts, not state-neutral diagnostic Gate invocations,
+which cannot advance a slice or job. Neither approval nor a failure starts an agent, repair, or
+Gate automatically. A generic resume cannot bypass an exhausted batch.
+
+## 9. Proposed human-facing operations
+
+The following spellings are proposals for approval. Successful operations emit JSON; errors go to
+stderr using the existing exit-code convention. They do not push, open a PR, or merge.
+
+```text
+factory project checks propose --project PATH
+factory project checks approve --project PATH --proposal PATH --approve
+factory job new --project PATH --title TITLE
+factory job worktree attach JOB_ID --branch LOCAL_BRANCH
+factory job baseline run JOB_ID
+factory job baseline approve-exception JOB_ID --attempt BASELINE_ATTEMPT_ID --test TEST_ID [--observed-attempt GATE_ATTEMPT_ID] --reason TEXT --approve
+factory job prepare JOB_ID --stage spec --path SPEC_PATH --scope SCOPE_PATH --approve
+factory job test-author restart JOB_ID --discard-manifest PATH --approve
+factory job prepare JOB_ID --stage tests --path CANDIDATE_MANIFEST --approve
+factory job initialize JOB_ID --profile PROFILE
+factory job prepare JOB_ID --stage plan --path PLAN_PATH --init-script PATH --approve
+factory job run JOB_ID --profile PROFILE
+factory job gate JOB_ID --base SHA --mode fast|full [--slice SLICE_ID]
+factory job gate-review approve JOB_ID --stage slice|final [--slice SLICE_ID] --reason TEXT --approve
+factory job test-retirement approve JOB_ID --test TEST_ID [--replacement TEST_ID] --reason TEXT --approve
+```
+
+Attachment automatically starts the baseline when an adapter is already approved. `baseline run`
+is an explicit new attempt after a failed/interrupted run, repair, environment change, or initial
+adapter approval; it is not an automatic retry. A person approves the spec only when an accepted
+baseline is valid. Its approval automatically starts Test Author. G1 accepts the exact
+Factory-generated candidate; an arbitrary externally authored manifest cannot substitute for it.
+The restart discard manifest lists reviewed paths and hashes and is subject to section 8.
+`--observed-attempt` is required only when reapproving the original fingerprint after an observed
+PASS. It binds that approval to the subsequent failed Gate evidence; it does not change that
+attempt's FAIL or bypass an exhausted Gate batch.
+
+Test retirement approval alone does not run Gate. Explicit continuation must revalidate all
+inputs. CLI names and recovery commands may be refined during review, not silently changed during
+implementation. For v2, `prepare --stage spec` also accepts a fresh approval from `SPEC_APPROVED`
+when its previous G0 has been invalidated; it must not start Test Author before the new baseline
+and G0 are durable. Gate review approval is allowed only after the stage's batch is exhausted;
+`--slice` is required for slice review and forbidden for final review. A local actor and reason
+are mandatory for exception, gate-review, and retirement decisions.
+
+## 10. Decision status and proposed amendments
+
+### 10.1 User choices to carry into this draft
+
+- A job may contain multiple features; initial full build/tests run once per accepted job baseline.
+- One final full Gate evaluates all features and their ACs; Slice Gate evaluates only the step.
+- New jobs use a human-approved Factory-owned project adapter and structured per-test v2 results.
+  An adapter that cannot report individual IDs/outcomes reliably stops rather than guessing.
+- A usable runner reporting zero existing tests can establish baseline if the build passes.
+- Qualified exceptions can automatically match later failures using minimally normalized evidence;
+  the residual risk of an identical symptom with a new cause is acknowledged.
+- Adapter exit `0` means valid completed report, even if tests fail; nonzero is adapter failure.
+- A change in the recorded relevant environment before Test Author requires a new baseline and,
+  after G0, a new G0. Local actor identity is audit data, not strong authentication.
+- Test Author initially creates only new test files. On failure it can restart from scratch after
+  human review; valid G0 and baseline need not be repeated.
+- Slice fast includes selected tests and applicable fast regressions, excluding pending tests.
+  Previously completed acceptance tests need not rerun unless included in fast regressions.
+- Missing baseline test IDs require human review. Retirement never claims execution and cannot
+  silently waive a required check.
+- A changed exception fingerprint requires repair. A slice or final Gate gets at most three
+  explicitly requested attempts per batch; a human review may approve a further batch of three.
+
+### 10.2 Earlier approved records needing separate explicit approval
+
+This draft proposes pre-G0 attachment for v2, unlike Chapter 1 and DD-03/DD-08/DD-11/DD-14.
+It proposes a Factory-owned adapter for v2, unlike the target-owned adapter in Chapter 3 and
+DD-09/DD-21/DD-23. It replaces the separately specified per-slice `baseline` mode for v2 with
+Slice `fast`, unlike Chapter 3/4 and DD-24. It proposes qualified passing verdicts for narrowly
+approved failures, unlike the unqualified PASS-only wording in Chapter 3/4 and DD-26/DD-27/DD-29.
+It proposes new-workflow preflight and approved project adapter setup while retaining DD-30's
+prohibition on unapproved infrastructure or CI changes.
+
+`design.md` also describes post-G0 attachment, a target-owned checks script, and PASS/FAIL-only
+Gate semantics. Amendments to that file, prior chapter contracts, and the decision register are
+not approved by approval of this draft alone. Request explicit approval before editing them.
+M1-specific approved behavior remains unchanged even if the new-workflow records are amended.
+
+### 10.3 Approval still required
+
+The exact adapter protocol, report fields, event names, commands, recovery rules, environment
+identity and fingerprint normalization above are proposed implementation details. Confirm this
+draft and the proposed changes to prior contracts separately before coding. If implementation
+reveals that a runner cannot supply the evidence, or a proposed invariant is not achievable
+without broadening scope, stop and consult the user rather than weakening it.
+
+## 11. Implementation slices and acceptance
+
+Each slice is a small vertical RED → GREEN cycle: first demonstrate a failing observable test,
+make the minimal implementation, rerun it and related regressions, inspect the diff, and record
+progress. Public seams are the CLI, persisted journal/artifact contracts, and temporary-Git
+workflow; their inclusion here is proposed for approval. No new dependency is assumed.
+
+| Slice | Observable acceptance criteria | Focused verification |
+|---|---|---|
+| 1. Version and attach | New `JOB_CREATED` selects v2 and can attach before G0; old unversioned M1 replays unchanged; unknown version fails. | CLI plus temporary Git; replay existing v1 fixtures and compare old artifacts. |
+| 2. Approved adapter | Proposal never executes guessed commands; approval pins exact project/config/adapter; changed or unapproved bytes block execution. | CLI with fake adapter and marker; project identity collision and hash negatives. |
+| 3. Baseline | Attach runs full build and complete discovery automatically with an approved adapter; zero tests is explicit; dirty/changed HEAD or incomplete results fail. | Temporary Git fake runner; PASS, build FAIL, empty discovery, timeout and worktree mutation. |
+| 4. Exceptions | One individually approved baseline failure yields a separate qualified disposition; mixed or non-waivable failure blocks it. | CLI and report tests for evidence, actor, report/SHA binding, recurrence, mismatch and PASS invalidation. |
+| 5. G0 and ACs | Valid baseline permits G0; spec and feature/AC mappings are pinned; changed SHA/environment invalidates G0 and requires reapproval. | CLI/replay tests for duplicate/unknown ACs, stale approval and post-G0 launch failure. |
+| 6. Test Author and G1 | One automatic session produces only new in-scope files and a complete manifest; G1 pins exact bytes; unsafe diff fails. | Fake Runner and temporary Git; out-of-scope writes, existing-file edits, changed HEAD and interrupted restart. |
+| 7. Red and checkpoint | Each approved test has assertion-red at the original base; one exact test-only commit is journaled before initializer/Builder. | Temporary Git positive and malformed red; crashes before/after commit/event; reject extra staged path or wrong parent. |
+| 8. Slice and final v2 | Slice executes selected and fast regressions without pending tests; final full build/tests evaluates all feature ACs and baseline inventory. | Fake adapter with individual IDs; missing/excluded tests, cross-slice AC, missing baseline IDs, and added Builder tests. |
+| 9. Qualified progression | Matching exceptions remain actual FAILs and are disclosed; valid qualified slice advances and final qualified Gate reaches review; no other failure can be waived. | CLI, report and replay tests, including exit codes, mixed failures, changed evidence and unexecuted checks. |
+| 10. Attempt limit | Three non-passing slice/final attempts block progression; a recorded human review opens at most three more without automatic execution. | CLI/replay tests for separate counters, interruption, resume bypass and new batches. |
+| 11. End-to-end recovery and M1 | Complete multi-feature workflow preserves SHA roles and review diff; interrupted operations never duplicate sessions/commits; M1 records and behavior remain unchanged. | Temporary Git integration and targeted existing M1 regression suite; no network, push, or real agent required. |
+
+The final contract approval must precede production implementation. Keep real-agent golden tasks
+separate from deterministic tests; do not claim they passed unless they were actually run.
