@@ -8,11 +8,11 @@
 ## Checkpoint summary
 
 - **Completed:** Chapter 4 contract approved on 2026-11-23; DD-23 and DD-24 recorded as approved.
-- **Latest slice commit:** CH4-04 — `e711b27` (`fix: recover interrupted Chapter 4 slices`).
-- **Verified:** Fetched `origin/main` is already contained in the feature branch; documentation
-  diff check passes.
+- **Latest slice commit:** CH4-05 — `73f7688` (`feat: run final Gate before review`).
+- **Verified:** Fetched `origin/main` is already contained in the feature branch; the full test
+  suite, compile check, and diff whitespace check pass.
 - **Current slice:** CH4-05 — completing the job and entering review; implementation is complete.
-- **Remaining:** Commit the verified CH4-05 changes and record its commit SHA.
+- **Remaining:** None.
 - **Blockers:** None.
 
 ## Slice status
@@ -23,7 +23,7 @@
 | CH4-02 — Initializing and locking the slice plan | Complete | 50 job CLI tests passed; 75 Gate/Runner regressions passed (1 skipped) | — | Depends on CH4-01 |
 | CH4-03 — Building and gating one TDD slice | Complete | 127 passed, 1 skipped; 2 focused tests passed | `d884be6` | Depends on CH4-02 |
 | CH4-04 — Recovering interrupted slices safely | Complete | 132 passed, 1 skipped; focused recovery tests passed | `e711b27` | Depends on CH4-01 through CH4-03 |
-| CH4-05 — Completing the job and entering review | Complete | 136 total, 1 skipped in full suite | Pending | Depends on CH4-03 and CH4-04 |
+| CH4-05 — Completing the job and entering review | Complete | 136 total, 1 skipped in full suite | `73f7688` | Depends on CH4-03 and CH4-04 |
 
 ## CH4-01 — Registering human-approved M1 inputs
 
