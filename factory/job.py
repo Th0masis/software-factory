@@ -3033,6 +3033,173 @@ def _fail_slice(job_dir, job_id, run_id, slice_id, stage, reason):
         )
 
 
+def _require_human_slice_recovery(job_dir, current, reason):
+    if current["job"]["state"] == "BUILDING":
+        _record_state_change(
+            job_dir,
+            current,
+            "NEEDS_HUMAN",
+            f"Interrupted slice requires human recovery: {reason}",
+        )
+    raise FactoryError(f"interrupted slice requires human recovery: {reason}")
+
+
+def _recover_committed_slice(job_dir, worktree, run_started):
+    head_before = run_started["head_before"]
+    head_after = _run_git(
+        worktree, ["rev-parse", "HEAD"], "resolve interrupted slice commit"
+    )
+    if head_after == head_before:
+        raise FactoryError("interrupted slice has no verifiable commit")
+    merge_base = _run_git(
+        worktree,
+        ["merge-base", head_before, head_after],
+        "verify interrupted slice commit ancestry",
+    )
+    if merge_base != head_before:
+        raise FactoryError("interrupted slice commit is not based on its recorded HEAD")
+    commit_count = _run_git(
+        worktree,
+        ["rev-list", "--count", f"{head_before}..{head_after}"],
+        "count interrupted slice commits",
+    )
+    if commit_count != "1":
+        raise FactoryError("interrupted slice does not have exactly one new commit")
+    if _worktree_changes(worktree):
+        raise FactoryError("interrupted slice worktree is dirty")
+    target_script = worktree / ".factory" / "init.py"
+    stored_script = job_dir / "init.py"
+    if (
+        target_script.is_symlink()
+        or not target_script.is_file()
+        or stored_script.is_symlink()
+        or not stored_script.is_file()
+        or hashlib.sha256(target_script.read_bytes()).digest()
+        != hashlib.sha256(stored_script.read_bytes()).digest()
+    ):
+        raise FactoryError("interrupted slice changed the approved initializer script")
+    return head_after
+
+
+def _complete_slice_gate(
+    factory_root,
+    job_dir,
+    job_id,
+    run_id,
+    feature,
+    item,
+    head_before,
+    commit_sha,
+    builder_handoff,
+):
+    from .gate import evaluate_gate
+
+    try:
+        gate_result = evaluate_gate(
+            factory_root,
+            job_id,
+            head_before,
+            "fast",
+            item["id"],
+        )
+    except (ConfigurationError, FactoryError, OSError) as error:
+        with _job_lock(job_dir):
+            current = _read_job_contents(job_dir, job_id)
+            if (
+                current["job"]["state"] != "BUILDING"
+                or current["last_event"]["type"] != "RUN_FINISHED"
+                or current["last_event"].get("run_id") != run_id
+            ):
+                raise FactoryError("job changed during slice Gate execution")
+            _record_slice_event(
+                job_dir,
+                current,
+                "SLICE_GATE_COMPLETED",
+                "Slice Gate could not complete",
+                {
+                    "run_id": run_id,
+                    "feature_id": feature["id"],
+                    "slice_id": item["id"],
+                    "outcome": "ERROR",
+                    "error": str(error),
+                },
+            )
+        _fail_slice(
+            job_dir,
+            job_id,
+            run_id,
+            item["id"],
+            "slice_gate",
+            str(error),
+        )
+        raise FactoryError(
+            f"slice Gate failed and requires human attention: {error}"
+        ) from error
+
+    report_path = gate_result.report_path.relative_to(job_dir).as_posix()
+    outcome = gate_result.verdict
+    with _job_lock(job_dir):
+        current = _read_job_contents(job_dir, job_id)
+        if (
+            current["job"]["state"] != "BUILDING"
+            or current["last_event"]["type"] != "RUN_FINISHED"
+            or current["last_event"].get("run_id") != run_id
+        ):
+            raise FactoryError("job changed during slice Gate execution")
+        _record_slice_event(
+            job_dir,
+            current,
+            "SLICE_GATE_COMPLETED",
+            f"Slice Gate returned {outcome}",
+            {
+                "run_id": run_id,
+                "feature_id": feature["id"],
+                "slice_id": item["id"],
+                "outcome": outcome,
+                "report_path": report_path,
+                "report_sha256": hashlib.sha256(
+                    gate_result.report_path.read_bytes()
+                ).hexdigest(),
+            },
+        )
+    if outcome != "PASS":
+        _fail_slice(
+            job_dir,
+            job_id,
+            run_id,
+            item["id"],
+            "slice_gate",
+            f"Gate report: {report_path}",
+        )
+        raise FactoryError(
+            f"slice Gate failed; diagnostics: {gate_result.report_path.parent}"
+        )
+    with _job_lock(job_dir):
+        current = _read_job_contents(job_dir, job_id)
+        if (
+            current["job"]["state"] != "BUILDING"
+            or current["last_event"]["type"] != "SLICE_GATE_COMPLETED"
+            or current["last_event"].get("run_id") != run_id
+            or current["last_event"].get("outcome") != "PASS"
+        ):
+            raise FactoryError("job changed before recording slice pass")
+        _record_slice_event(
+            job_dir,
+            current,
+            "SLICE_PASSED",
+            f"Slice {item['id']} passed",
+            {
+                "run_id": run_id,
+                "feature_id": feature["id"],
+                "slice_id": item["id"],
+                "commit_sha": commit_sha,
+                "test_ids": item["test_ids"],
+                "handoff": builder_handoff,
+                "report_path": report_path,
+            },
+        )
+
+
 def run_job(factory_root, job_id, profile_name):
     factory_root = Path(factory_root).resolve()
     job_id, job_dir = _job_location(factory_root, job_id)
@@ -3042,16 +3209,36 @@ def run_job(factory_root, job_id, profile_name):
     profile = config.profiles[profile_name]
 
     while True:
+        recovery_to_gate = None
+        recovered_pass = False
         with _job_lock(job_dir):
             current = _read_job_contents(job_dir, job_id)
             job = JobRecord.model_validate(current["job"])
             if job.state != "BUILDING":
                 raise ConfigurationError("slice run requires BUILDING")
-            if current["last_event"]["type"] == "RUN_STARTED":
-                raise FactoryError(
-                    "an interrupted slice run requires human recovery; no session was restarted"
-                )
             _, events = _read_event_log(job_dir / "events.jsonl", job_id)
+            slice_events = [
+                event
+                for event in events
+                if event["type"]
+                in {"RUN_STARTED", "RUN_FINISHED", "SLICE_GATE_COMPLETED", "SLICE_PASSED"}
+            ]
+            latest_slice_event = slice_events[-1] if slice_events else None
+            finished_run_ids = {
+                event["run_id"]
+                for event in events
+                if event["type"] == "RUN_FINISHED"
+            }
+            unfinished_runs = [
+                event
+                for event in events
+                if event["type"] == "RUN_STARTED"
+                and event["run_id"] not in finished_run_ids
+            ]
+            if len(unfinished_runs) > 1:
+                _require_human_slice_recovery(
+                    job_dir, current, "multiple incomplete slice sessions exist"
+                )
             plan = _approved_plan(job_dir)
             plan_event = next(
                 event
@@ -3099,58 +3286,232 @@ def run_job(factory_root, job_id, profile_name):
                 None,
             )
             if pending is None:
+                if unfinished_runs:
+                    _require_human_slice_recovery(
+                        job_dir, current, "incomplete run has no pending slice"
+                    )
                 return current
             feature, item = pending
-            head_before = _run_git(
-                worktree, ["rev-parse", "HEAD"], "resolve slice starting commit"
-            )
-            run_id = uuid4().hex
-            handoff = next(
-                (
-                    event["handoff"]
-                    for event in reversed(events)
-                    if event["type"] == "SLICE_PASSED"
-                ),
-                "",
-            )
-            history = _run_git(
-                worktree, ["log", "-5", "--oneline"], "read recent Git history"
-            )
-            task_content = _slice_task(
-                (job_dir / "spec.md").read_bytes(),
-                feature,
-                item,
-                tests,
-                scope,
-                handoff,
-                history,
-            ).encode("utf-8")
-            attempt_dir = job_dir / "slice-runs"
-            if attempt_dir.is_symlink() or (
-                attempt_dir.exists() and not attempt_dir.is_dir()
-            ):
-                raise FactoryError("invalid slice run artifact directory")
-            attempt_dir.mkdir(exist_ok=True)
-            attempt_dir = attempt_dir / run_id
-            attempt_dir.mkdir()
-            task_snapshot = attempt_dir / "task.md"
-            _write_durable_artifact(task_snapshot, task_content)
-            start = _record_slice_event(
-                job_dir,
-                current,
-                "RUN_STARTED",
-                f"Started slice {item['id']}",
-                {
-                    "run_id": run_id,
-                    "feature_id": feature["id"],
-                    "slice_id": item["id"],
-                    "profile": profile_name,
-                    "head_before": head_before,
-                    "plan_sha256": plan_hash,
-                    "task_path": task_snapshot.relative_to(job_dir).as_posix(),
-                    "task_sha256": hashlib.sha256(task_content).hexdigest(),
-                },
-            )
+            if unfinished_runs:
+                run_started = unfinished_runs[0]
+                if (
+                    current["last_event"]["type"] != "RUN_STARTED"
+                    or current["last_event"].get("run_id") != run_started["run_id"]
+                    or run_started["feature_id"] != feature["id"]
+                    or run_started["slice_id"] != item["id"]
+                ):
+                    _require_human_slice_recovery(
+                        job_dir,
+                        current,
+                        "incomplete run is not the latest journaled operation",
+                    )
+                try:
+                    commit_sha = _recover_committed_slice(
+                        job_dir, worktree, run_started
+                    )
+                except (ConfigurationError, FactoryError, OSError) as error:
+                    _require_human_slice_recovery(job_dir, current, str(error))
+                run_id = run_started["run_id"]
+                head_before = run_started["head_before"]
+                builder_handoff = (
+                    "Recovered the committed slice after an interruption; "
+                    "no builder handoff was recorded."
+                )
+                _record_slice_event(
+                    job_dir,
+                    current,
+                    "RUN_FINISHED",
+                    f"Recovered committed slice {item['id']}",
+                    {
+                        "run_id": run_id,
+                        "feature_id": feature["id"],
+                        "slice_id": item["id"],
+                        "outcome": "OK",
+                        "commit_sha": commit_sha,
+                        "test_ids": item["test_ids"],
+                        "handoff": builder_handoff,
+                        "task_sha256": run_started["task_sha256"],
+                        "recovered": True,
+                    },
+                )
+                recovery_to_gate = (
+                    run_id,
+                    feature,
+                    item,
+                    head_before,
+                    commit_sha,
+                    builder_handoff,
+                )
+            elif latest_slice_event is not None and latest_slice_event["type"] in {
+                "RUN_FINISHED",
+                "SLICE_GATE_COMPLETED",
+            }:
+                if current["last_event"]["seq"] != latest_slice_event["seq"]:
+                    _require_human_slice_recovery(
+                        job_dir,
+                        current,
+                        "incomplete slice has intervening journal events",
+                    )
+                if (
+                    latest_slice_event["feature_id"] != feature["id"]
+                    or latest_slice_event["slice_id"] != item["id"]
+                ):
+                    _require_human_slice_recovery(
+                        job_dir, current, "incomplete event does not match pending slice"
+                    )
+                if latest_slice_event["type"] == "RUN_FINISHED":
+                    if latest_slice_event["outcome"] != "OK":
+                        failure_stage = latest_slice_event.get("failure_stage", "runner")
+                        failure_reason = latest_slice_event.get(
+                            "failure_reason", "interrupted runner failed"
+                        )
+                        _record_state_change(
+                            job_dir,
+                            current,
+                            "NEEDS_HUMAN",
+                            f"Slice {item['id']} failed: {failure_reason}",
+                            details={
+                                "failure_stage": failure_stage,
+                                "failure_reason": failure_reason,
+                                "run_id": latest_slice_event["run_id"],
+                                "slice_id": item["id"],
+                            },
+                        )
+                        raise FactoryError(
+                            f"interrupted slice failed and requires human attention: "
+                            f"{failure_reason}"
+                        )
+                    run_started = next(
+                        event
+                        for event in events
+                        if event["type"] == "RUN_STARTED"
+                        and event["run_id"] == latest_slice_event["run_id"]
+                    )
+                    try:
+                        commit_sha = _recover_committed_slice(
+                            job_dir, worktree, run_started
+                        )
+                    except (ConfigurationError, FactoryError, OSError) as error:
+                        _require_human_slice_recovery(job_dir, current, str(error))
+                    if commit_sha != latest_slice_event["commit_sha"]:
+                        _require_human_slice_recovery(
+                            job_dir, current, "recorded slice commit no longer matches HEAD"
+                        )
+                    recovery_to_gate = (
+                        latest_slice_event["run_id"],
+                        feature,
+                        item,
+                        run_started["head_before"],
+                        commit_sha,
+                        latest_slice_event["handoff"],
+                    )
+                elif latest_slice_event["outcome"] == "PASS":
+                    run_finished = events[-2]
+                    run_started = events[-3]
+                    try:
+                        commit_sha = _recover_committed_slice(
+                            job_dir, worktree, run_started
+                        )
+                    except (ConfigurationError, FactoryError, OSError) as error:
+                        _require_human_slice_recovery(job_dir, current, str(error))
+                    if commit_sha != run_finished.get("commit_sha"):
+                        _require_human_slice_recovery(
+                            job_dir, current, "recorded slice commit no longer matches HEAD"
+                        )
+                    _record_slice_event(
+                        job_dir,
+                        current,
+                        "SLICE_PASSED",
+                        f"Recovered Gate-passed slice {item['id']}",
+                        {
+                            "run_id": latest_slice_event["run_id"],
+                            "feature_id": feature["id"],
+                            "slice_id": item["id"],
+                            "commit_sha": run_finished["commit_sha"],
+                            "test_ids": run_finished["test_ids"],
+                            "handoff": run_finished["handoff"],
+                            "report_path": latest_slice_event["report_path"],
+                        },
+                    )
+                    recovered_pass = True
+                else:
+                    failure_reason = (
+                        latest_slice_event.get("error")
+                        or f"Gate report: {latest_slice_event.get('report_path')}"
+                    )
+                    _record_state_change(
+                        job_dir,
+                        current,
+                        "NEEDS_HUMAN",
+                        f"Slice {item['id']} Gate failed: {failure_reason}",
+                        details={
+                            "failure_stage": "slice_gate",
+                            "failure_reason": failure_reason,
+                            "run_id": latest_slice_event["run_id"],
+                            "slice_id": item["id"],
+                        },
+                    )
+                    raise FactoryError(
+                        f"interrupted slice Gate failed and requires human attention: "
+                        f"{failure_reason}"
+                    )
+            else:
+                head_before = _run_git(
+                    worktree, ["rev-parse", "HEAD"], "resolve slice starting commit"
+                )
+                run_id = uuid4().hex
+                handoff = next(
+                    (
+                        event["handoff"]
+                        for event in reversed(events)
+                        if event["type"] == "SLICE_PASSED"
+                    ),
+                    "",
+                )
+                history = _run_git(
+                    worktree, ["log", "-5", "--oneline"], "read recent Git history"
+                )
+                task_content = _slice_task(
+                    (job_dir / "spec.md").read_bytes(),
+                    feature,
+                    item,
+                    tests,
+                    scope,
+                    handoff,
+                    history,
+                ).encode("utf-8")
+                attempt_dir = job_dir / "slice-runs"
+                if attempt_dir.is_symlink() or (
+                    attempt_dir.exists() and not attempt_dir.is_dir()
+                ):
+                    raise FactoryError("invalid slice run artifact directory")
+                attempt_dir.mkdir(exist_ok=True)
+                attempt_dir = attempt_dir / run_id
+                attempt_dir.mkdir()
+                task_snapshot = attempt_dir / "task.md"
+                _write_durable_artifact(task_snapshot, task_content)
+                start = _record_slice_event(
+                    job_dir,
+                    current,
+                    "RUN_STARTED",
+                    f"Started slice {item['id']}",
+                    {
+                        "run_id": run_id,
+                        "feature_id": feature["id"],
+                        "slice_id": item["id"],
+                        "profile": profile_name,
+                        "head_before": head_before,
+                        "plan_sha256": plan_hash,
+                        "task_path": task_snapshot.relative_to(job_dir).as_posix(),
+                        "task_sha256": hashlib.sha256(task_content).hexdigest(),
+                    },
+                )
+
+        if recovered_pass:
+            continue
+        if recovery_to_gate is not None:
+            _complete_slice_gate(factory_root, job_dir, job_id, *recovery_to_gate)
+            continue
 
         task_file = worktree / ".factory" / "task.md"
         if (
@@ -3330,7 +3691,7 @@ def run_job(factory_root, job_id, profile_name):
                 or current["job"]["state"] != "BUILDING"
             ):
                 raise FactoryError("job changed during builder session")
-            finished = _record_slice_event(
+            _record_slice_event(
                 job_dir,
                 current,
                 "RUN_FINISHED",
@@ -3351,109 +3712,14 @@ def run_job(factory_root, job_id, profile_name):
                 f"builder session failed and requires human attention: {runner_error}"
             )
 
-        from .gate import evaluate_gate
-
-        try:
-            gate_result = evaluate_gate(
-                factory_root,
-                job_id,
-                head_before,
-                "fast",
-                item["id"],
-            )
-        except (ConfigurationError, FactoryError, OSError) as error:
-            with _job_lock(job_dir):
-                current = _read_job_contents(job_dir, job_id)
-                if (
-                    current["job"]["state"] != "BUILDING"
-                    or current["last_event"]["type"] != "RUN_FINISHED"
-                    or current["last_event"].get("run_id") != run_id
-                ):
-                    raise FactoryError("job changed during slice Gate execution")
-                gate_event = _record_slice_event(
-                    job_dir,
-                    current,
-                    "SLICE_GATE_COMPLETED",
-                    "Slice Gate could not complete",
-                    {
-                        "run_id": run_id,
-                        "feature_id": feature["id"],
-                        "slice_id": item["id"],
-                        "outcome": "ERROR",
-                        "error": str(error),
-                    },
-                )
-            _fail_slice(
-                job_dir,
-                job_id,
-                run_id,
-                item["id"],
-                "slice_gate",
-                str(error),
-            )
-            raise FactoryError(
-                f"slice Gate failed and requires human attention: {error}"
-            ) from error
-
-        report_path = gate_result.report_path.relative_to(job_dir).as_posix()
-        outcome = gate_result.verdict
-        with _job_lock(job_dir):
-            current = _read_job_contents(job_dir, job_id)
-            if (
-                current["job"]["state"] != "BUILDING"
-                or current["last_event"]["type"] != "RUN_FINISHED"
-                or current["last_event"].get("run_id") != run_id
-            ):
-                raise FactoryError("job changed during slice Gate execution")
-            gate_event = _record_slice_event(
-                job_dir,
-                current,
-                "SLICE_GATE_COMPLETED",
-                f"Slice Gate returned {outcome}",
-                {
-                    "run_id": run_id,
-                    "feature_id": feature["id"],
-                    "slice_id": item["id"],
-                    "outcome": outcome,
-                    "report_path": report_path,
-                    "report_sha256": hashlib.sha256(
-                        gate_result.report_path.read_bytes()
-                    ).hexdigest(),
-                },
-            )
-        if outcome != "PASS":
-            _fail_slice(
-                job_dir,
-                job_id,
-                run_id,
-                item["id"],
-                "slice_gate",
-                f"Gate report: {report_path}",
-            )
-            raise FactoryError(
-                f"slice Gate failed; diagnostics: {gate_result.report_path.parent}"
-            )
-        with _job_lock(job_dir):
-            current = _read_job_contents(job_dir, job_id)
-            if (
-                current["job"]["state"] != "BUILDING"
-                or current["last_event"]["type"] != "SLICE_GATE_COMPLETED"
-                or current["last_event"].get("run_id") != run_id
-                or current["last_event"].get("outcome") != "PASS"
-            ):
-                raise FactoryError("job changed before recording slice pass")
-            _record_slice_event(
-                job_dir,
-                current,
-                "SLICE_PASSED",
-                f"Slice {item['id']} passed",
-                {
-                    "run_id": run_id,
-                    "feature_id": feature["id"],
-                    "slice_id": item["id"],
-                    "commit_sha": commit_sha,
-                    "test_ids": item["test_ids"],
-                    "handoff": builder_handoff,
-                    "report_path": report_path,
-                },
-            )
+        _complete_slice_gate(
+            factory_root,
+            job_dir,
+            job_id,
+            run_id,
+            feature,
+            item,
+            head_before,
+            commit_sha,
+            builder_handoff,
+        )

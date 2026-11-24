@@ -384,6 +384,60 @@ class JobCreateCliTests(unittest.TestCase):
                     )
         return exit_code, output.getvalue()
 
+    def _commit_acceptance_slice(self, job_dir, runner_calls):
+        def commit_slice(role, profile, task_file, cwd, session_name):
+            runner_calls.append(task_file.read_text(encoding="utf-8"))
+            source_path = cwd / "src" / "test_acceptance.py"
+            source_path.parent.mkdir(exist_ok=True)
+            source_path.write_text("value = 1\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "add", "--", "src/test_acceptance.py"],
+                cwd=cwd,
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "Implement acceptance slice",
+                    "--",
+                    "src/test_acceptance.py",
+                ],
+                cwd=cwd,
+                check=True,
+            )
+            run_dir = job_dir / "runs" / str(len(runner_calls) + 1)
+            run_dir.mkdir()
+            stdout_path = run_dir / "stdout.jsonl"
+            stdout_path.write_text(
+                json.dumps(
+                    {
+                        "type": "assistant.message",
+                        "content": "Completed the acceptance slice.",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            session_path = run_dir / "session.md"
+            session_path.write_text("Builder session\n", encoding="utf-8")
+            return RunResult(
+                outcome="OK",
+                exit_code=0,
+                usage=None,
+                session_id="fake-builder-session",
+                paths={
+                    "run_dir": run_dir,
+                    "stdout": stdout_path,
+                    "session": session_path,
+                },
+                error=None,
+            )
+
+        return commit_slice
+
     def test_initialize_persists_pending_plan_and_script_from_runner_jsonl(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             (
@@ -1109,6 +1163,283 @@ class JobCreateCliTests(unittest.TestCase):
                 "",
             )
 
+    def test_run_regates_a_committed_slice_without_restarting_runner(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (
+                factory_root,
+                _target_repo,
+                env,
+                job_id,
+                _plan,
+                _init_script,
+                initializer_result,
+            ) = self._prepare_initializer_job(Path(temp_dir))
+            initialized, output = self._run_initializer(
+                factory_root, job_id, initializer_result
+            )
+            self.assertEqual(initialized, 0, output)
+            init_event = json.loads(output)["last_event"]
+            job_dir = factory_root / "jobs" / job_id
+            approved = self._run_cli(
+                factory_root,
+                env,
+                "job",
+                "prepare",
+                job_id,
+                "--stage",
+                "plan",
+                "--path",
+                str(job_dir / init_event["plan_path"]),
+                "--init-script",
+                str(job_dir / init_event["init_script_path"]),
+                "--approve",
+            )
+            self.assertEqual(approved.returncode, 0, approved.stderr)
+            worktree = Path(json.loads(approved.stdout)["job"]["worktree_path"])
+            runner_calls = []
+            commit_slice = self._commit_acceptance_slice(job_dir, runner_calls)
+
+            record_slice_event = job_service._record_slice_event
+
+            def interrupt_before_run_finished(
+                target_dir, current, event_type, reason, details
+            ):
+                if event_type == "RUN_FINISHED":
+                    raise OSError("simulated interruption after builder commit")
+                return record_slice_event(
+                    target_dir, current, event_type, reason, details
+                )
+
+            command = ["job", "run", job_id, "--profile", "initializer-test"]
+            output = io.StringIO()
+            with patch("factory.cli.Path.cwd", return_value=factory_root):
+                with patch("factory.runner.run_agent", side_effect=commit_slice):
+                    with patch(
+                        "factory.job._record_slice_event",
+                        side_effect=interrupt_before_run_finished,
+                    ):
+                        with redirect_stdout(output):
+                            first_exit = cli_main(command)
+
+            self.assertEqual(first_exit, 1)
+            self.assertEqual(len(runner_calls), 1)
+            events = [
+                json.loads(line)
+                for line in (job_dir / "events.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertEqual(events[-1]["type"], "RUN_STARTED")
+            self.assertNotEqual(
+                subprocess.run(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=worktree,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip(),
+                events[-1]["head_before"],
+            )
+            self.assertEqual(
+                subprocess.run(
+                    ["git", "status", "--porcelain"],
+                    cwd=worktree,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout,
+                "",
+            )
+
+            output = io.StringIO()
+            with patch("factory.cli.Path.cwd", return_value=factory_root):
+                with patch(
+                    "factory.runner.run_agent",
+                    side_effect=AssertionError("recovery must not start another session"),
+                ):
+                    with redirect_stdout(output):
+                        recovered_exit = cli_main(command)
+
+            self.assertEqual(recovered_exit, 0, output.getvalue())
+            self.assertEqual(len(runner_calls), 1)
+            recovered = job_service.read_job(factory_root, job_id)
+            self.assertEqual(recovered["last_event"]["type"], "SLICE_PASSED")
+            self.assertEqual(recovered["job"]["state"], "BUILDING")
+            self.assertEqual(
+                [event["type"] for event in events].count("RUN_STARTED"),
+                1,
+            )
+
+    def test_run_regates_after_run_finished_without_restarting_runner(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (
+                factory_root,
+                _target_repo,
+                env,
+                job_id,
+                _plan,
+                _init_script,
+                initializer_result,
+            ) = self._prepare_initializer_job(Path(temp_dir))
+            initialized, output = self._run_initializer(
+                factory_root, job_id, initializer_result
+            )
+            self.assertEqual(initialized, 0, output)
+            init_event = json.loads(output)["last_event"]
+            job_dir = factory_root / "jobs" / job_id
+            approved = self._run_cli(
+                factory_root,
+                env,
+                "job",
+                "prepare",
+                job_id,
+                "--stage",
+                "plan",
+                "--path",
+                str(job_dir / init_event["plan_path"]),
+                "--init-script",
+                str(job_dir / init_event["init_script_path"]),
+                "--approve",
+            )
+            self.assertEqual(approved.returncode, 0, approved.stderr)
+            runner_calls = []
+            commit_slice = self._commit_acceptance_slice(job_dir, runner_calls)
+            command = ["job", "run", job_id, "--profile", "initializer-test"]
+
+            with patch("factory.cli.Path.cwd", return_value=factory_root):
+                with patch("factory.runner.run_agent", side_effect=commit_slice):
+                    with patch("factory.gate.evaluate_gate", side_effect=KeyboardInterrupt):
+                        with self.assertRaises(KeyboardInterrupt):
+                            cli_main(command)
+
+            self.assertEqual(len(runner_calls), 1)
+            events = [
+                json.loads(line)
+                for line in (job_dir / "events.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertEqual(events[-1]["type"], "RUN_FINISHED")
+            self.assertEqual(events[-1]["outcome"], "OK")
+
+            output = io.StringIO()
+            with patch("factory.cli.Path.cwd", return_value=factory_root):
+                with patch(
+                    "factory.runner.run_agent",
+                    side_effect=AssertionError("recovery must not start another session"),
+                ):
+                    with redirect_stdout(output):
+                        recovered_exit = cli_main(command)
+
+            self.assertEqual(recovered_exit, 0, output.getvalue())
+            self.assertEqual(len(runner_calls), 1)
+            recovered = job_service.read_job(factory_root, job_id)
+            self.assertEqual(recovered["last_event"]["type"], "SLICE_PASSED")
+            self.assertEqual(
+                sum(event["type"] == "RUN_STARTED" for event in events), 1
+            )
+
+    def test_run_recovers_after_gate_event_projection_failure(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (
+                factory_root,
+                _target_repo,
+                env,
+                job_id,
+                _plan,
+                _init_script,
+                initializer_result,
+            ) = self._prepare_initializer_job(Path(temp_dir))
+            initialized, output = self._run_initializer(
+                factory_root, job_id, initializer_result
+            )
+            self.assertEqual(initialized, 0, output)
+            init_event = json.loads(output)["last_event"]
+            job_dir = factory_root / "jobs" / job_id
+            approved = self._run_cli(
+                factory_root,
+                env,
+                "job",
+                "prepare",
+                job_id,
+                "--stage",
+                "plan",
+                "--path",
+                str(job_dir / init_event["plan_path"]),
+                "--init-script",
+                str(job_dir / init_event["init_script_path"]),
+                "--approve",
+            )
+            self.assertEqual(approved.returncode, 0, approved.stderr)
+            runner_calls = []
+            commit_slice = self._commit_acceptance_slice(job_dir, runner_calls)
+            write_projections = job_service._write_job_projections
+            projection_failures = []
+
+            def fail_after_gate(target_dir, events):
+                if (
+                    events[-1]["type"] == "SLICE_GATE_COMPLETED"
+                    and events[-1]["outcome"] == "PASS"
+                    and not projection_failures
+                ):
+                    projection_failures.append(events[-1])
+                    raise OSError("simulated projection write failure")
+                return write_projections(target_dir, events)
+
+            command = ["job", "run", job_id, "--profile", "initializer-test"]
+            with patch("factory.cli.Path.cwd", return_value=factory_root):
+                with patch("factory.runner.run_agent", side_effect=commit_slice):
+                    with patch(
+                        "factory.job._write_job_projections",
+                        side_effect=fail_after_gate,
+                    ):
+                        first_exit = cli_main(command)
+
+            self.assertEqual(first_exit, 1)
+            self.assertEqual(len(runner_calls), 1)
+            events = [
+                json.loads(line)
+                for line in (job_dir / "events.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertEqual(events[-1]["type"], "SLICE_GATE_COMPLETED")
+            self.assertEqual(events[-1]["outcome"], "PASS")
+            self.assertNotIn("SLICE_PASSED", [event["type"] for event in events])
+
+            (job_dir / "features.json").unlink()
+            (job_dir / "progress.md").unlink()
+            status_result = self._run_cli(factory_root, env, "job", "status", job_id)
+
+            self.assertEqual(status_result.returncode, 0, status_result.stderr)
+            self.assertEqual(
+                json.loads(status_result.stdout)["last_event"]["type"],
+                "SLICE_GATE_COMPLETED",
+            )
+            features = json.loads((job_dir / "features.json").read_text(encoding="utf-8"))
+            self.assertFalse(features["features"][0]["slices"][0]["passes"])
+            self.assertIn("pending", (job_dir / "progress.md").read_text(encoding="utf-8"))
+
+            output = io.StringIO()
+            with patch("factory.cli.Path.cwd", return_value=factory_root):
+                with patch(
+                    "factory.runner.run_agent",
+                    side_effect=AssertionError("recovery must not start another session"),
+                ):
+                    with patch(
+                        "factory.gate.evaluate_gate",
+                        side_effect=AssertionError("recovery must not rerun the Gate"),
+                    ):
+                        with redirect_stdout(output):
+                            recovered_exit = cli_main(command)
+
+            self.assertEqual(recovered_exit, 0, output.getvalue())
+            self.assertEqual(len(runner_calls), 1)
+            recovered = job_service.read_job(factory_root, job_id)
+            self.assertEqual(recovered["last_event"]["type"], "SLICE_PASSED")
+            features = json.loads((job_dir / "features.json").read_text(encoding="utf-8"))
+            self.assertTrue(features["features"][0]["slices"][0]["passes"])
+
     def test_run_does_not_restart_an_interrupted_slice_session(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             (
@@ -1145,6 +1476,9 @@ class JobCreateCliTests(unittest.TestCase):
 
             def interrupt_builder(*args):
                 runner_calls.append(args)
+                user_change = args[3] / "src" / "interrupted-change.py"
+                user_change.parent.mkdir(parents=True, exist_ok=True)
+                user_change.write_text("preserve = True\n", encoding="utf-8")
                 raise KeyboardInterrupt
 
             command = ["job", "run", job_id, "--profile", "initializer-test"]
@@ -1159,9 +1493,39 @@ class JobCreateCliTests(unittest.TestCase):
 
             self.assertEqual(exit_code, 1)
             self.assertEqual(len(runner_calls), 1)
+            worktree = Path(
+                job_service.read_job(factory_root, job_id)["job"]["worktree_path"]
+            )
+            user_change = worktree / "src" / "interrupted-change.py"
+            self.assertEqual(user_change.read_text(encoding="utf-8"), "preserve = True\n")
             status = job_service.read_job(factory_root, job_id)
-            self.assertEqual(status["job"]["state"], "BUILDING")
-            self.assertEqual(status["last_event"]["type"], "RUN_STARTED")
+            self.assertEqual(status["job"]["state"], "NEEDS_HUMAN")
+            self.assertEqual(status["last_event"]["type"], "JOB_STATE_CHANGED")
+
+            with patch("factory.cli.Path.cwd", return_value=factory_root):
+                with patch(
+                    "factory.runner.run_agent",
+                    side_effect=AssertionError("resume must not restart an uncertain session"),
+                ):
+                    resumed = cli_main(
+                        [
+                            "job",
+                            "resume",
+                            job_id,
+                            "--reason",
+                            "Inspect interrupted slice",
+                        ]
+                    )
+                    self.assertEqual(resumed, 0)
+                    output = io.StringIO()
+                    with redirect_stdout(output):
+                        exit_code = cli_main(command)
+
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(len(runner_calls), 1)
+            self.assertEqual(user_change.read_text(encoding="utf-8"), "preserve = True\n")
+            status = job_service.read_job(factory_root, job_id)
+            self.assertEqual(status["job"]["state"], "NEEDS_HUMAN")
 
     def test_run_does_not_run_init_script_when_worktree_is_dirty(self):
         with tempfile.TemporaryDirectory() as temp_dir:
