@@ -102,7 +102,10 @@ factory/                       # samostatné repo továrny (DD-01)
   worktrees/<job-id>/          # git worktree cílového projektu
 ```
 
-V cílovém projektu: `.factory/checks.py` (kontrakt gate), `.factory/protected.txt` a testy v existující testovací struktuře projektu. Factory nepředepisuje univerzální adresář; trvalé testy nejsou pouze v `jobs/<job-id>/`.
+V M1 je checks kontrakt `.factory/checks.py` v cílovém projektu. Nové v2 joby používají člověkem
+schválený Factory-owned adaptér mimo cílový worktree. V cílovém projektu zůstává
+`.factory/protected.txt` a testy v existující projektové struktuře. Factory nepředepisuje
+univerzální test adresář; trvalé testy nejsou pouze v `jobs/<job-id>/`.
 
 ---
 
@@ -141,11 +144,11 @@ Důvod pořadí: deterministická kostra a gate dávají hodnotu hned a bez nich
 **Cílový projekt a větve** (DD-03, DD-08, DD-14):
 
 Továrna žije ve vlastním repu. Kód mění vždy v **repu cílové aplikace**: worktree se připojí
-k existující připravené větvi a leží mimo cílový repozitář. Job nejprve vzniká jako metadata;
-po schválení specifikace člověk připraví nepoužívanou lokální větev a Factory ji připojí.
-Factory větev sama nevytváří, nemaže, neresetuje ani nepřepisuje.
+k existující připravené větvi a leží mimo cílový repozitář. Job nejprve vzniká jako metadata.
+V M1 se worktree připojí po schválení specifikace; u nových v2 jobů se připojí před G0 a Factory
+ověří výchozí baseline. Factory větev sama nevytváří, nemaže, neresetuje ani nepřepisuje.
 
-Konfigurace projektu `.factory/project.json` určuje cílový repozitář a kontroly:
+Konfigurace projektu `.factory/project.json` určuje cílový repozitář; M1 používá i target checks:
 
 ```json
 {
@@ -224,9 +227,9 @@ copilot -p "Follow .factory/task.md" -C <worktree> \
 nemění stav jobu ani nespouští review.
 
 **Dvě části:**
-1. `.factory/checks.py` v cílovém projektu poskytuje `--fast` a `--full`. Fast spouští testy
-   vybraného slice a relevantní rychlé kontroly; full spouští úplnou projektovou sadu. Přesné
-   příkazy a test discovery respektují existující projekt.
+1. M1 používá `.factory/checks.py` v cílovém projektu. Nový v2 workflow používá schválený
+   Factory-owned adaptér. Slice fast spouští vybrané testy a relevantní rychlé regrese bez
+   čekajících testů; full spouští úplný build a projektovou testovou sadu.
 2. Factory `gate.py` ověřuje scope, chráněné cesty, integritu schválených Test Author testů,
    kontrolní report a výsledek projektu.
 
@@ -241,9 +244,10 @@ Validation. Nevzniká druhý Gate engine ani duplicitní běh stejné sady.
 testovaný `head_sha`, čas a trvání, required checks, AC↔test výsledky, hash vstupů a odkazy na
 logy. `risk` zůstává `DEFERRED` do kapitoly 7.
 
-**Verdict:** overall PASS/FAIL je odvozen pouze z povinných kontrol. Každé chybějící, neplatné,
-neprovedené nebo přeskočené povinné ověření znamená FAIL. WARNING je možné jen u výslovně
-nepovinných kontrol.
+**Verdict:** povinné kontroly rozhodují o PASS/FAIL; v2 může při schváleném opakovaném selhání
+existujícího testu vrátit `PASS_WITH_EXCEPTION` s pravdivým FAIL výsledkem a důkazy. Shoda důkazů
+neprokazuje stejnou příčinu. Chybějící, neplatné, neprovedené nebo přeskočené povinné ověření
+znamená FAIL. WARNING je možné jen u výslovně nepovinných kontrol.
 
 **Scope a ochrana:**
 - změny mimo schválený scope nebo chráněné cesty znamenají FAIL;
@@ -277,10 +281,10 @@ a Git history.
    a spustí relevantní testy. Všechny registrované testy zůstávají beze změny; v Test Author
    workflow jsou navíc chráněny hashem. Nové trvalé testy ukládá do projektové konvence; dočasné
    diagnostiky se neprezentují jako regresní ochrana.
-4. Builder vytvoří commit před Slice Gate. Gate ověří tento přesný commit; PASS teprve poté
-   orchestrátor zaznamená slice jako ověřený a může pokračovat.
-5. Po všech slices běží jeden finální full Gate. PASS otevře `REVIEW`; FAIL zachová práci a vede
-   do `NEEDS_HUMAN`.
+4. Builder vytvoří commit před Slice Gate. Gate ověří tento přesný commit; PASS nebo ve v2
+   `PASS_WITH_EXCEPTION` umožní orchestrátoru zaznamenat slice jako ověřený.
+5. Po všech slices běží jeden finální full Gate. PASS nebo ve v2 `PASS_WITH_EXCEPTION` otevře
+   `REVIEW`; FAIL zachová práci a vyžaduje lidský zásah.
 
 Chapter 4/M1 nemá automatické retry. Builder nikdy nepushuje ani nevytváří PR. Factory nevynucuje
 univerzální test adresář a nemění CI bez lidského schválení.

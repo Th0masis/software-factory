@@ -1,15 +1,14 @@
 # Chapters 3, 5, and 6 — Baseline, Test Author, and Feature Validation Contract
 
-- **Status:** Draft for explicit approval; not authorization to write production code.
+- **Status:** Approved for implementation by the user on 2026-11-24.
 - **Scope:** New jobs only. Existing M1 jobs and records retain their current behavior.
 - **Inputs:** [`design.md`](../../design.md), [`chapter-01.md`](./chapter-01.md),
   [`chapter-03.md`](./chapter-03.md), [`chapter-04.md`](./chapter-04.md), and
   [`design-deviations.md`](./design-deviations.md).
-- **Decision provenance:** The workflow direction and the choices identified in section 10 were
-  discussed with the user on 2026-11-24. The exact interfaces, schemas, and slices below are
-  proposed for review; they are not yet approved.
-- **Earlier contracts:** Section 10 identifies proposed amendments. This draft does not itself
-  amend previously approved documents or the decision register.
+- **Decision provenance:** The workflow direction, choices in section 10, and the interfaces,
+  schemas, and slices below were approved by the user on 2026-11-24.
+- **Earlier contracts:** The user separately approved the v2-specific amendments identified in
+  section 10. Existing M1 requirements and records remain unchanged.
 
 ## 1. Goal and boundaries
 
@@ -584,7 +583,7 @@ Gate automatically. A generic resume cannot bypass an exhausted batch.
 
 ## 9. Proposed human-facing operations
 
-The following spellings are proposals for approval. Successful operations emit JSON; errors go to
+The following spellings are the approved interfaces. Successful operations emit JSON; errors go to
 stderr using the existing exit-code convention. They do not push, open a PR, or merge.
 
 ```text
@@ -616,8 +615,8 @@ PASS. It binds that approval to the subsequent failed Gate evidence; it does not
 attempt's FAIL or bypass an exhausted Gate batch.
 
 Test retirement approval alone does not run Gate. Explicit continuation must revalidate all
-inputs. CLI names and recovery commands may be refined during review, not silently changed during
-implementation. For v2, `prepare --stage spec` also accepts a fresh approval from `SPEC_APPROVED`
+inputs. CLI names and recovery commands must not be silently changed during implementation.
+For v2, `prepare --stage spec` also accepts a fresh approval from `SPEC_APPROVED`
 when its previous G0 has been invalidated; it must not start Test Author before the new baseline
 and G0 are durable. Gate review approval is allowed only after the stage's batch is exhausted;
 `--slice` is required for slice review and forbidden for final review. A local actor and reason
@@ -646,7 +645,7 @@ are mandatory for exception, gate-review, and retirement decisions.
 - A changed exception fingerprint requires repair. A slice or final Gate gets at most three
   explicitly requested attempts per batch; a human review may approve a further batch of three.
 
-### 10.2 Earlier approved records needing separate explicit approval
+### 10.2 Approved amendments to earlier records
 
 This draft proposes pre-G0 attachment for v2, unlike Chapter 1 and DD-03/DD-08/DD-11/DD-14.
 It proposes a Factory-owned adapter for v2, unlike the target-owned adapter in Chapter 3 and
@@ -656,29 +655,27 @@ approved failures, unlike the unqualified PASS-only wording in Chapter 3/4 and D
 It proposes new-workflow preflight and approved project adapter setup while retaining DD-30's
 prohibition on unapproved infrastructure or CI changes.
 
-`design.md` also describes post-G0 attachment, a target-owned checks script, and PASS/FAIL-only
-Gate semantics. Amendments to that file, prior chapter contracts, and the decision register are
-not approved by approval of this draft alone. Request explicit approval before editing them.
-M1-specific approved behavior remains unchanged even if the new-workflow records are amended.
+`design.md` also described post-G0 attachment, a target-owned checks script, and PASS/FAIL-only
+Gate semantics. The user separately approved targeted updates to that file, Chapters 1, 3 and 4,
+and the decision register on 2026-11-24. M1-specific approved behavior remains unchanged.
 
-### 10.3 Approval still required
+### 10.3 Implementation boundary
 
-The exact adapter protocol, report fields, event names, commands, recovery rules, environment
-identity and fingerprint normalization above are proposed implementation details. Confirm this
-draft and the proposed changes to prior contracts separately before coding. If implementation
-reveals that a runner cannot supply the evidence, or a proposed invariant is not achievable
-without broadening scope, stop and consult the user rather than weakening it.
+The adapter protocol, report fields, event names, commands, recovery rules, environment identity,
+and fingerprint normalization above are approved for implementation. If implementation reveals
+that a runner cannot supply the evidence, or an invariant is not achievable without broadening
+scope, stop and consult the user rather than weakening it.
 
 ## 11. Implementation slices and acceptance
 
 Each slice is a small vertical RED → GREEN cycle: first demonstrate a failing observable test,
 make the minimal implementation, rerun it and related regressions, inspect the diff, and record
 progress. Public seams are the CLI, persisted journal/artifact contracts, and temporary-Git
-workflow; their inclusion here is proposed for approval. No new dependency is assumed.
+workflow; these seams were approved with the contract. No new dependency is assumed.
 
 | Slice | Observable acceptance criteria | Focused verification |
 |---|---|---|
-| 1. Version and attach | New `JOB_CREATED` selects v2 and can attach before G0; old unversioned M1 replays unchanged; unknown version fails. | CLI plus temporary Git; replay existing v1 fixtures and compare old artifacts. |
+| 1. Version and attach | New `JOB_CREATED` selects v2 and can attach before G0; G0 stays blocked until baseline exists; old unversioned M1 replays unchanged; unknown version fails. | CLI plus temporary Git; replay existing v1 fixtures and compare old artifacts. |
 | 2. Approved adapter | Proposal never executes guessed commands; approval pins exact project/config/adapter; changed or unapproved bytes block execution. | CLI with fake adapter and marker; project identity collision and hash negatives. |
 | 3. Baseline | Attach runs full build and complete discovery automatically with an approved adapter; zero tests is explicit; dirty/changed HEAD or incomplete results fail. | Temporary Git fake runner; PASS, build FAIL, empty discovery, timeout and worktree mutation. |
 | 4. Exceptions | One individually approved baseline failure yields a separate qualified disposition; mixed or non-waivable failure blocks it. | CLI and report tests for evidence, actor, report/SHA binding, recurrence, mismatch and PASS invalidation. |
@@ -690,5 +687,5 @@ workflow; their inclusion here is proposed for approval. No new dependency is as
 | 10. Attempt limit | Three non-passing slice/final attempts block progression; a recorded human review opens at most three more without automatic execution. | CLI/replay tests for separate counters, interruption, resume bypass and new batches. |
 | 11. End-to-end recovery and M1 | Complete multi-feature workflow preserves SHA roles and review diff; interrupted operations never duplicate sessions/commits; M1 records and behavior remain unchanged. | Temporary Git integration and targeted existing M1 regression suite; no network, push, or real agent required. |
 
-The final contract approval must precede production implementation. Keep real-agent golden tasks
-separate from deterministic tests; do not claim they passed unless they were actually run.
+Keep real-agent golden tasks separate from deterministic tests; do not claim they passed unless
+they were actually run.

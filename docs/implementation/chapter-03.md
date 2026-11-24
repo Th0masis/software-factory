@@ -10,6 +10,11 @@
 This contract defines the factory-side Gate and its target-project checks interface. It does not
 modify `design.md`. Implementation starts only after explicit approval of this contract.
 
+> **Approved v2 amendment — 2026-11-24:** New jobs use the human-approved Factory-owned checks
+> adapter, full initial baseline, per-test evidence, qualified verdicts, and slice-fast regression
+> selection in the [v2 contract](./chapter-05-06-test-author-validation.md). No separate v2
+> per-slice baseline Gate mode is added. The M1 contract and existing v1 records remain unchanged.
+
 > **Implementation status clarification — 2026-11-24:** The approved Chapter 4 text below specifies
 > a `baseline` Gate mode, but the current `factory job gate` CLI accepts only `fast|full` with an
 > optional slice ID. Baseline-red remains a separate `checks.py --red` input-readiness check.

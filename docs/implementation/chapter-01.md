@@ -7,6 +7,11 @@
 
 This contract translates the reviewed Chapter 1 decisions into testable work. It does not amend `design.md`. Implementation must follow this contract; changes to its agreed requirements require explicit approval.
 
+> **Approved v2 amendment — 2026-11-24:** New workflow-v2 jobs attach the prepared worktree in
+> `DRAFT_SPEC` before G0 and record the workflow version at creation. Initial baseline and G0
+> follow the [v2 contract](./chapter-05-06-test-author-validation.md). Existing M1 jobs retain
+> the post-G0 attachment, state, journal, and recovery behavior below.
+
 ## 1. Scope
 
 ### Goals

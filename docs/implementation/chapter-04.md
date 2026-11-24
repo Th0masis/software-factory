@@ -10,6 +10,12 @@
 This contract translates the Chapter 4 review into a testable execution contract. It does not amend
 `design.md`. Implementation starts only after this contract is explicitly approved.
 
+> **Approved v2 amendment — 2026-11-24:** New jobs use automatic Test Author, G1, baseline-red,
+> a test-only checkpoint, and qualified Gate results under the
+> [v2 contract](./chapter-05-06-test-author-validation.md). Three failed attempts per slice or
+> final Gate require a human review before another batch. M1 and its recovery remain unchanged;
+> no automatic retry is introduced.
+
 > **Implementation status clarification — 2026-11-24:** This approved contract specifies
 > `factory job gate --mode baseline|fast|full`, but the current CLI accepts only `fast|full` with an
 > optional slice ID. Baseline-red is separately implemented by test registration through
