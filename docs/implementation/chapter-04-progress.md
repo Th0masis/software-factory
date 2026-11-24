@@ -9,6 +9,7 @@
 ## Checkpoint summary
 
 - **Completed:** Chapter 4 contract approved on 2026-11-23; DD-23 and DD-24 recorded as approved.
+- **Latest slice commit:** CH4-03 — `d884be6` (`feat: run and gate Chapter 4 slices`).
 - **Verified:** Fetched `origin/main` is already contained in the feature branch; documentation
   diff check passes.
 - **Current slice:** CH4-04 — recovering interrupted slices safely.
@@ -21,7 +22,7 @@
 |---|---|---|---|---|
 | CH4-01 — Registering human-approved M1 inputs | Complete | 40 job CLI, 30 Gate service, 8 Gate CLI tests passed; 7 new registration cases | `8c2d84f` | Contract mapping prerequisite moved to CH4-02 |
 | CH4-02 — Initializing and locking the slice plan | Complete | 50 job CLI tests passed; 75 Gate/Runner regressions passed (1 skipped) | — | Depends on CH4-01 |
-| CH4-03 — Building and gating one TDD slice | Complete | 127 passed, 1 skipped; 2 focused tests passed | — | Depends on CH4-02 |
+| CH4-03 — Building and gating one TDD slice | Complete | 127 passed, 1 skipped; 2 focused tests passed | `d884be6` | Depends on CH4-02 |
 | CH4-04 — Recovering interrupted slices safely | Pending | — | — | Depends on CH4-01 through CH4-03 |
 | CH4-05 — Completing the job and entering review | Pending | — | — | Depends on CH4-03 and CH4-04 |
 

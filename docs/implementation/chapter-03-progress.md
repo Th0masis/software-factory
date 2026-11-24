@@ -166,6 +166,7 @@
   selected slice's test ID. `py -3.14 -m unittest tests.test_job_create tests.test_gate
   tests.test_gate_cli tests.test_runner -v` — 127 passed, 1 skipped; the focused two-slice
   orchestration test also passed after handoff projection was hardened.
+- **Implementation commit:** `d884be6` (`feat: run and gate Chapter 4 slices`).
 - **Unverified:** No real target project's `.factory/checks.py` has been run; the selected-manifest
   protocol has only been verified with a temporary project.
 
