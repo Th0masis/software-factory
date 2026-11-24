@@ -170,6 +170,22 @@
 - **Unverified:** No real target project's `.factory/checks.py` has been run; the selected-manifest
   protocol has only been verified with a temporary project.
 
+## Chapter 4 follow-up — interrupted-slice recovery (CH4-04)
+
+- **Implementation:** Interrupted runs are recovered from the authoritative journal. A single
+  clean commit made before `RUN_FINISHED` is re-gated; a persisted `RUN_FINISHED` continues at the
+  Gate; and a persisted Gate PASS recovers the slice projection without starting another Runner.
+- **Failure safety:** Missing/ambiguous commits and dirty worktrees escalate to `NEEDS_HUMAN`
+  without cleanup. Tests preserve user changes and exercise a projection-write failure followed
+  by `factory job status` reconstruction.
+- **Verification:** `py -3.14 -m unittest tests.test_job_create tests.test_gate tests.test_gate_cli
+  tests.test_runner -v` — 132 passed, 1 skipped; compileall and `git -c
+  core.whitespace=cr-at-eol diff --check` passed. A focused preservation test passed after its
+  final assertion was added.
+- **Unverified:** No real Copilot builder session or production project checks script has been
+  exercised; deployment Python compatibility remains open.
+- **Implementation commit:** `e711b27` (`fix: recover interrupted Chapter 4 slices`).
+
 ## Checkpoint policy
 
 After each slice, record exact RED/GREEN/regression commands, results, reviewed files, and commit

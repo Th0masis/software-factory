@@ -1,7 +1,6 @@
 # Chapter 4 — Progress
 
-- **Overall status:** In progress; CH4-01 through CH4-03 are complete, and CH4-04 through CH4-05
-  remain pending.
+- **Overall status:** In progress; CH4-01 through CH4-04 are complete, and CH4-05 remains pending.
 - **Current branch:** `feat/chapter-04-runner-security`
 - **Contract:** [`chapter-04.md`](./chapter-04.md)
 - **Design deltas:** [`design-deviations.md`](./design-deviations.md)
@@ -9,11 +8,11 @@
 ## Checkpoint summary
 
 - **Completed:** Chapter 4 contract approved on 2026-11-23; DD-23 and DD-24 recorded as approved.
-- **Latest slice commit:** CH4-03 — `d884be6` (`feat: run and gate Chapter 4 slices`).
+- **Latest slice commit:** CH4-04 — `e711b27` (`fix: recover interrupted Chapter 4 slices`).
 - **Verified:** Fetched `origin/main` is already contained in the feature branch; documentation
   diff check passes.
-- **Current slice:** CH4-04 — recovering interrupted slices safely.
-- **Remaining:** CH4-04 and CH4-05.
+- **Current slice:** CH4-05 — completing the job and entering review.
+- **Remaining:** CH4-05.
 - **Blockers:** None.
 
 ## Slice status
@@ -23,7 +22,7 @@
 | CH4-01 — Registering human-approved M1 inputs | Complete | 40 job CLI, 30 Gate service, 8 Gate CLI tests passed; 7 new registration cases | `8c2d84f` | Contract mapping prerequisite moved to CH4-02 |
 | CH4-02 — Initializing and locking the slice plan | Complete | 50 job CLI tests passed; 75 Gate/Runner regressions passed (1 skipped) | — | Depends on CH4-01 |
 | CH4-03 — Building and gating one TDD slice | Complete | 127 passed, 1 skipped; 2 focused tests passed | `d884be6` | Depends on CH4-02 |
-| CH4-04 — Recovering interrupted slices safely | Pending | — | — | Depends on CH4-01 through CH4-03 |
+| CH4-04 — Recovering interrupted slices safely | Complete | 132 passed, 1 skipped; focused recovery tests passed | `e711b27` | Depends on CH4-01 through CH4-03 |
 | CH4-05 — Completing the job and entering review | Pending | — | — | Depends on CH4-03 and CH4-04 |
 
 ## CH4-01 — Registering human-approved M1 inputs
@@ -122,3 +121,28 @@
   tests, and journaled as passed only after Gate PASS. The worktree cleanliness, selected test IDs,
   failure stop, successful sequencing, no-restart interruption behavior, and single-line handoff
   projection are verified.
+
+## CH4-04 — Recovering interrupted slices safely
+
+- **Test seam:** The public `factory job run JOB_ID --profile PROFILE` and `factory job status`
+  commands, using a fake Runner, temporary Git project, and the real selected-slice Gate.
+- **Recovery boundaries verified:** An interrupted run with no verifiable commit is escalated
+  without restarting the Runner and preserves uncommitted user work. A clean commit interrupted
+  before `RUN_FINISHED` is re-gated; a persisted `RUN_FINISHED` resumes at the Gate; a persisted
+  Gate PASS with a projection-write failure rebuilds projections from the journal and records the
+  slice pass without another Runner or Gate execution.
+- **RED/GREEN:** The interrupted-commit test first reproduced a refused recovery after the commit.
+  Recovery now accepts only one clean descendant commit with the approved initializer unchanged.
+  Additional injected interruptions verified continuation after `RUN_FINISHED` and after Gate PASS.
+  Invalid or ambiguous history escalates to `NEEDS_HUMAN`; it is not automatically cleaned.
+- **Regression:** `py -3.14 -m unittest tests.test_job_create tests.test_gate tests.test_gate_cli
+  tests.test_runner -v` — 132 passed, 1 skipped. The focused interruption-preservation test passed
+  again after strengthening it to assert user changes remain on disk.
+- **Additional checks:** `py -3.14 -m compileall -q factory tests` and
+  `git -c core.whitespace=cr-at-eol diff --check` passed.
+- **Unverified:** Recovery uses temporary repositories and a fake Runner; no real Copilot builder
+  session or production project's `.factory/checks.py` was exercised. The deployment Python
+  environment remains unverified, as recorded under CH4-03.
+- **CH4-04 result:** The journal remains authoritative across tested crash boundaries; uncertain
+  sessions are never restarted, verified commits are re-gated, and uncommitted user changes are
+  preserved.
