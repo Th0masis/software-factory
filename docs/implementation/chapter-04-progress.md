@@ -1,6 +1,6 @@
 # Chapter 4 — Progress
 
-- **Overall status:** In progress; CH4-01 and CH4-02 are complete, and CH4-03 through CH4-05
+- **Overall status:** In progress; CH4-01 through CH4-03 are complete, and CH4-04 through CH4-05
   remain pending.
 - **Current branch:** `feat/chapter-04-runner-security`
 - **Contract:** [`chapter-04.md`](./chapter-04.md)
@@ -11,8 +11,8 @@
 - **Completed:** Chapter 4 contract approved on 2026-11-23; DD-23 and DD-24 recorded as approved.
 - **Verified:** Fetched `origin/main` is already contained in the feature branch; documentation
   diff check passes.
-- **Current slice:** CH4-03 — building and gating one TDD slice.
-- **Remaining:** CH4-03 through CH4-05.
+- **Current slice:** CH4-04 — recovering interrupted slices safely.
+- **Remaining:** CH4-04 and CH4-05.
 - **Blockers:** None.
 
 ## Slice status
@@ -21,7 +21,7 @@
 |---|---|---|---|---|
 | CH4-01 — Registering human-approved M1 inputs | Complete | 40 job CLI, 30 Gate service, 8 Gate CLI tests passed; 7 new registration cases | `8c2d84f` | Contract mapping prerequisite moved to CH4-02 |
 | CH4-02 — Initializing and locking the slice plan | Complete | 50 job CLI tests passed; 75 Gate/Runner regressions passed (1 skipped) | — | Depends on CH4-01 |
-| CH4-03 — Building and gating one TDD slice | Pending | — | — | Depends on CH4-02 |
+| CH4-03 — Building and gating one TDD slice | Complete | 127 passed, 1 skipped; 2 focused tests passed | — | Depends on CH4-02 |
 | CH4-04 — Recovering interrupted slices safely | Pending | — | — | Depends on CH4-01 through CH4-03 |
 | CH4-05 — Completing the job and entering review | Pending | — | — | Depends on CH4-03 and CH4-04 |
 
@@ -89,3 +89,35 @@
 - **CH4-02 result:** Initializer output is attempt-pinned, human approval locks the validated plan
   and script, and invalid results escalate durably without discarding target changes. Diff review
   confirmed only the approved contract/progress and CH4-02 implementation/test files changed.
+
+## CH4-03 — Building and gating one TDD slice
+
+- **Test seam:** The user approved exercising `factory job run JOB_ID --profile PROFILE` through
+  the public CLI with a fake Runner and a temporary Git project using the real Gate/checks path.
+  Verify state and journal through `factory job status`, plus the immutable Gate report.
+- **Verified before implementation:** The topic branch is clean and contains fetched `origin/main`.
+  The current CLI has no `job run` command, and Gate has no selected-slice mode yet.
+
+- **RED/GREEN:** The first `job run` test failed because the command was not registered. Added
+  sequential slice execution, per-slice Gate selection, pass journaling/projections, and failure
+  escalation. The selected-slice failure, two-slice pass sequencing, dirty-worktree, and interrupted
+  session cases now pass. A multiline handoff projection test failed before whitespace flattening
+  and passed after the handoff was reduced to one Markdown line.
+- **Gate evidence:** Temporary-project checks confirmed the Gate report contains only the selected
+  slice's registered test ID. A failed Gate leaves the slice unpassed, starts no next session, and
+  escalates to `NEEDS_HUMAN`; a passing Gate records each slice once and proceeds sequentially.
+- **Verification:** `py -3.14 -m unittest tests.test_job_create tests.test_gate tests.test_gate_cli
+  tests.test_runner -v` — 127 passed, 1 skipped (Windows symlink privilege). The focused
+  `test_run_does_not_restart_an_interrupted_slice_session` and updated two-slice projection test
+  also passed after their latest changes.
+  `py -3.14 -m compileall -q factory tests` passed.
+- **Unverified and to verify:** No real Copilot builder session or target-project `checks.py` has
+  been run; the runner and checks protocol were exercised with fakes and a temporary project.
+  Initializer execution succeeded in the temporary project, but timeout behavior and compatibility
+  with the deployment's Python executable/environment remain unverified. `sys.executable` is still
+  the implementation assumption. Recovery after interruption is not implemented in CH4-03 and
+  remains CH4-04 work; current behavior refuses to restart an uncertain session.
+- **CH4-03 result:** Each slice is initialized, run once, independently gated against its registered
+  tests, and journaled as passed only after Gate PASS. The worktree cleanliness, selected test IDs,
+  failure stop, successful sequencing, no-restart interruption behavior, and single-line handoff
+  projection are verified.

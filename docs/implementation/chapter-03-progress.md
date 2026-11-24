@@ -156,6 +156,19 @@
   whitespace check passed.
 - **Runner test repair commit:** `0d8a6c5` (`test: make Runner timeout tests deterministic`).
 
+## Chapter 4 follow-up — selected-slice Gate extension
+
+- **Purpose:** CH4-03 depends on the state-neutral Chapter 3 Gate accepting a selected slice.
+- **Implementation:** `factory job gate --slice` is restricted to fast mode; Gate narrows the
+  change scope to the approved slice paths and passes a filtered manifest of its registered tests
+  to the target checks script.
+- **Verification:** Temporary-project integration verifies the checks report includes only the
+  selected slice's test ID. `py -3.14 -m unittest tests.test_job_create tests.test_gate
+  tests.test_gate_cli tests.test_runner -v` — 127 passed, 1 skipped; the focused two-slice
+  orchestration test also passed after handoff projection was hardened.
+- **Unverified:** No real target project's `.factory/checks.py` has been run; the selected-manifest
+  protocol has only been verified with a temporary project.
+
 ## Checkpoint policy
 
 After each slice, record exact RED/GREEN/regression commands, results, reviewed files, and commit

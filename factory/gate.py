@@ -15,6 +15,7 @@ from .job import (
     ConfigurationError,
     FactoryConfig,
     FactoryError,
+    _validate_registered_tests,
     _job_location,
     _load_model,
     _read_event_log,
@@ -387,7 +388,7 @@ def run_checks(
 ):
     if not isinstance(mode, str) or mode not in {"fast", "full", "red"}:
         raise ConfigurationError("mode must be 'fast', 'full', or 'red'")
-    if mode == "red":
+    if mode == "red" or manifest_path is not None:
         if (
             not isinstance(manifest_path, Path)
             or not manifest_path.is_absolute()
@@ -399,18 +400,20 @@ def run_checks(
             or any(not isinstance(test_id, str) or not test_id for test_id in test_ids)
             or len(set(test_ids)) != len(test_ids)
         ):
-            raise ConfigurationError("invalid baseline-red check inputs")
+            raise ConfigurationError("invalid manifest check inputs")
         try:
             if (
                 not manifest_path.is_file()
                 or hashlib.sha256(manifest_path.read_bytes()).hexdigest()
                 != manifest_sha256
             ):
-                raise ConfigurationError("registered test manifest is missing or changed")
+                raise ConfigurationError("test manifest is missing or changed")
         except OSError as error:
             raise ConfigurationError(
-                f"cannot read registered test manifest: {error}"
+                f"cannot read test manifest: {error}"
             ) from error
+    elif manifest_sha256 is not None or test_ids is not None:
+        raise ConfigurationError("manifest hash and test IDs require a manifest path")
     if not isinstance(config, FactoryConfig):
         raise ConfigurationError("config must be a validated factory config")
     secret_names = _validate_secret_env_vars(config)
@@ -464,6 +467,8 @@ def run_checks(
                 )
             else:
                 arguments.append(f"--{mode}")
+                if manifest_path is not None:
+                    arguments.extend(["--manifest", str(manifest_path)])
             process = _spawn_process(
                 arguments,
                 cwd=worktree,
@@ -511,6 +516,12 @@ def run_checks(
                     stdout_data, base_sha, manifest_sha256, test_ids
                 )
             else:
+                if manifest_path is not None and (
+                    manifest_path.is_symlink()
+                    or hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+                    != manifest_sha256
+                ):
+                    raise ValueError("test manifest changed during checks")
                 report, checks = _parse_checks_report(stdout_data)
         except ValueError as report_error:
             error = str(report_error)
@@ -659,23 +670,86 @@ def _write_gate_artifacts(attempt_dir, report, checks_result):
     return report_path
 
 
-def evaluate_gate(factory_root, job_id, base_sha, mode):
+def _slice_check_inputs(job_dir, job, slice_id):
+    plan_path = job_dir / "slice-plan.json"
+    tests_path = job_dir / "tests.json"
+    try:
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        manifest_content = tests_path.read_bytes()
+    except (OSError, ValueError, UnicodeDecodeError) as error:
+        raise ConfigurationError(f"cannot read approved slice inputs: {error}") from error
+    slices = [
+        item
+        for feature in plan.get("features", [])
+        for item in feature.get("slices", [])
+        if item.get("id") == slice_id
+    ]
+    if len(slices) != 1:
+        raise ConfigurationError(f"unknown slice ID: {slice_id}")
+    registered_tests = _validate_registered_tests(
+        job_dir,
+        job,
+        hashlib.sha256(manifest_content).hexdigest(),
+    )[1]
+    selected_ids = slices[0]["test_ids"]
+    selected_tests = [
+        test for test in registered_tests["tests"] if test["id"] in selected_ids
+    ]
+    if len(selected_tests) != len(selected_ids):
+        raise ConfigurationError("slice references an unknown registered test")
+    filtered_manifest = (
+        json.dumps(
+            {"schema_version": 1, "tests": selected_tests},
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("utf-8")
+    return slices[0], selected_ids, filtered_manifest
+
+
+def evaluate_gate(factory_root, job_id, base_sha, mode, slice_id=None):
     if not isinstance(mode, str) or mode not in {"fast", "full"}:
         raise ConfigurationError("mode must be 'fast' or 'full'")
+    if slice_id is not None and (
+        mode != "fast" or not isinstance(slice_id, str) or not slice_id
+    ):
+        raise ConfigurationError("--slice requires fast mode and a non-empty slice ID")
     config, job_id, job_dir, job, worktree = _gate_job_context(
         factory_root, job_id
     )
     _validate_secret_env_vars(config)
     scope_manifest = _read_scope_manifest(job_dir, worktree)
+    selected_slice = None
+    selected_test_ids = None
+    filtered_manifest = None
+    if slice_id is not None:
+        selected_slice, selected_test_ids, filtered_manifest = _slice_check_inputs(
+            job_dir, job, slice_id
+        )
+        scope_manifest = selected_slice["paths"]
     assessment = assess_changes(worktree, base_sha, scope_manifest)
 
     attempt_dir = _create_gate_attempt(job_dir)
+    manifest_path = None
+    manifest_sha256 = None
+    if filtered_manifest is not None:
+        manifest_path = attempt_dir / "slice-tests.json"
+        try:
+            with manifest_path.open("xb") as stream:
+                stream.write(filtered_manifest)
+                stream.flush()
+                os.fsync(stream.fileno())
+        except OSError as error:
+            raise FactoryError(f"cannot write slice test manifest: {error}") from error
+        manifest_sha256 = hashlib.sha256(filtered_manifest).hexdigest()
     checks_result = None
     report = {
         "schema_version": 1,
         "job_id": job_id,
         "base_sha": base_sha,
         "mode": mode,
+        "slice_id": slice_id,
         "checks": [],
         "checks_report": None,
         "checks_error": None,
@@ -698,7 +772,15 @@ def evaluate_gate(factory_root, job_id, base_sha, mode):
             reasons.append("protected-path violations")
         report["checks_skipped"] = ", ".join(reasons)
     else:
-        checks_result = run_checks(worktree, base_sha, mode, config)
+        checks_result = run_checks(
+            worktree,
+            base_sha,
+            mode,
+            config,
+            manifest_path=manifest_path,
+            manifest_sha256=manifest_sha256,
+            test_ids=selected_test_ids,
+        )
         report["checks"] = list(checks_result.checks)
         report["checks_report"] = checks_result.report
         report["checks_error"] = checks_result.error

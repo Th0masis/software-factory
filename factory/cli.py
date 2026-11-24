@@ -20,6 +20,7 @@ from .job import (
     release_worktree,
     repair_worktree,
     resume_job,
+    run_job,
     transition_job,
 )
 
@@ -41,6 +42,9 @@ def _parser():
     initialize = job_commands.add_parser("initialize")
     initialize.add_argument("job_id")
     initialize.add_argument("--profile", required=True)
+    run = job_commands.add_parser("run")
+    run.add_argument("job_id")
+    run.add_argument("--profile", required=True)
     status = job_commands.add_parser("status")
     status.add_argument("job_id")
     transition = job_commands.add_parser("transition")
@@ -54,6 +58,7 @@ def _parser():
     gate.add_argument("job_id")
     gate.add_argument("--base", required=True)
     gate.add_argument("--mode", choices=("fast", "full"), required=True)
+    gate.add_argument("--slice")
     worktree = job_commands.add_parser("worktree")
     worktree_commands = worktree.add_subparsers(
         dest="worktree_command", required=True
@@ -93,6 +98,8 @@ def main(argv=None):
                 )
         elif args.job_command == "initialize":
             result = initialize_job(Path.cwd(), args.job_id, args.profile)
+        elif args.job_command == "run":
+            result = run_job(Path.cwd(), args.job_id, args.profile)
         elif args.job_command == "status":
             result = read_job(Path.cwd(), args.job_id)
         elif args.job_command == "transition":
@@ -101,7 +108,7 @@ def main(argv=None):
             result = resume_job(Path.cwd(), args.job_id, args.reason)
         elif args.job_command == "gate":
             result = evaluate_gate(
-                Path.cwd(), args.job_id, args.base, args.mode
+                Path.cwd(), args.job_id, args.base, args.mode, args.slice
             )
             print(
                 json.dumps(

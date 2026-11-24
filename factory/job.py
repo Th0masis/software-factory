@@ -9,6 +9,7 @@ from pathlib import PurePosixPath
 import re
 import stat
 import subprocess
+import sys
 import tempfile
 from typing import Literal
 from uuid import UUID, uuid4
@@ -763,6 +764,10 @@ def _read_event_log(path, job_id):
                     and event_job.state == "NEEDS_HUMAN"
                     and event.get("failure_stage") == "initializer"
                 )
+                is_slice_failure = (
+                    event["type"] == "JOB_STATE_CHANGED"
+                    and _validate_slice_failure_state(job, event, events[-1])
+                )
                 has_input_metadata = any(
                     key in event for key in ("input_path", "input_sha256")
                 )
@@ -850,6 +855,16 @@ def _read_event_log(path, job_id):
                             f"invalid slice plan metadata for job {job_id}"
                         )
                     _validate_approved_plan_artifacts(path.parent, event)
+                elif is_slice_failure:
+                    if (
+                        has_input_metadata
+                        or has_red_metadata
+                        or has_plan_metadata
+                        or not has_initializer_failure
+                    ):
+                        raise ConfigurationError(
+                            f"invalid slice failure event for job {job_id}"
+                        )
                 elif is_initializer_failure:
                     if (
                         has_input_metadata
@@ -872,6 +887,13 @@ def _read_event_log(path, job_id):
                     raise ConfigurationError(
                         f"unexpected registered input metadata for job {job_id}"
                     )
+            elif event["type"] in {
+                "RUN_STARTED",
+                "RUN_FINISHED",
+                "SLICE_GATE_COMPLETED",
+                "SLICE_PASSED",
+            }:
+                _validate_run_event(path.parent, events, event, event_job)
             elif event["type"] == "INITIALIZER_RUN_STARTED":
                 if (
                     job.state != "TESTS_RED_OK"
@@ -1100,6 +1122,7 @@ def _read_job_contents(job_dir, job_id):
         raise FactoryError(f"cannot read job snapshot {job_id}: {error}") from error
     if snapshot != job:
         _write_snapshot(snapshot_path, job)
+    _write_job_projections(job_dir, events)
     return {"job": job.model_dump(mode="json"), "last_event": events[-1]}
 
 
@@ -1114,7 +1137,11 @@ def _persist_event(job_dir, event, updated):
         stream.write(json.dumps(event, sort_keys=True) + "\n")
         stream.flush()
         os.fsync(stream.fileno())
-    _write_snapshot(job_dir / "job.json", updated)
+    persisted_job, events = _read_event_log(job_dir / "events.jsonl", updated.job_id)
+    if persisted_job != updated:
+        raise ConfigurationError("persisted event job snapshot does not match")
+    _write_snapshot(job_dir / "job.json", persisted_job)
+    _write_job_projections(job_dir, events)
     return {"job": updated.model_dump(mode="json"), "last_event": event}
 
 
@@ -1595,6 +1622,330 @@ def _validate_approved_plan_artifacts(job_dir, event):
         raise ConfigurationError(f"cannot read approved scope: {error}") from error
     if scope_hash != event["scope_sha256"]:
         raise ConfigurationError("approved scope hash mismatch")
+
+
+def _approved_plan(job_dir):
+    path = job_dir / "slice-plan.json"
+    if path.is_symlink() or not path.is_file():
+        raise ConfigurationError("approved slice plan is missing or invalid")
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError) as error:
+        raise ConfigurationError(f"cannot read approved slice plan: {error}") from error
+
+
+def _find_plan_slice(job_dir, feature_id, slice_id):
+    matches = [
+        (feature, item)
+        for feature in _approved_plan(job_dir)["features"]
+        for item in feature["slices"]
+        if feature["id"] == feature_id and item["id"] == slice_id
+    ]
+    if len(matches) != 1:
+        raise ConfigurationError("slice event does not match the approved plan")
+    return matches[0]
+
+
+def _write_projection(path, content):
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise ConfigurationError(f"invalid projection path: {path.name}")
+    if path.is_file() and path.read_bytes() == content:
+        return
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=path.parent,
+            prefix=f".{path.name}-",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            temporary.write(content)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, path)
+    except OSError as error:
+        raise FactoryError(f"cannot write {path.name} projection: {error}") from error
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def _write_job_projections(job_dir, events):
+    approval = next(
+        (
+            event
+            for event in events
+            if event["type"] == "JOB_STATE_CHANGED"
+            and event.get("from") == "TESTS_RED_OK"
+            and event.get("to") == "BUILDING"
+        ),
+        None,
+    )
+    if approval is None:
+        return
+    plan = _approved_plan(job_dir)
+    passed = {
+        event["slice_id"]: event
+        for event in events
+        if event["type"] == "SLICE_PASSED"
+    }
+    features = []
+    progress_lines = ["# Job progress", ""]
+    next_slice = None
+    for feature in plan["features"]:
+        feature_slices = []
+        feature_passes = True
+        progress_lines.extend([f"## {feature['title']}", ""])
+        for item in feature["slices"]:
+            event = passed.get(item["id"])
+            has_passed = event is not None
+            feature_passes = feature_passes and has_passed
+            if not has_passed and next_slice is None:
+                next_slice = item
+            projection_slice = dict(item)
+            projection_slice["passes"] = has_passed
+            if event is not None:
+                projection_slice.update(
+                    {
+                        "commit_sha": event["commit_sha"],
+                        "tests": event["test_ids"],
+                    }
+                )
+            feature_slices.append(projection_slice)
+            progress_lines.append(
+                f"- **{item['id']}** — {'PASS' if has_passed else 'pending'}"
+            )
+            if event is not None:
+                progress_lines.append(f"  - Commit: `{event['commit_sha']}`")
+                progress_lines.append(
+                    f"  - Tests: {', '.join(event['test_ids'])}"
+                )
+                progress_lines.append(
+                    f"  - Handoff: {' '.join(event['handoff'].split())}"
+                )
+            progress_lines.append("")
+        features.append(
+            {
+                "id": feature["id"],
+                "title": feature["title"],
+                "passes": feature_passes,
+                "slices": feature_slices,
+            }
+        )
+    if next_slice is None:
+        progress_lines.extend(["All planned slices have passed.", ""])
+    else:
+        progress_lines.extend([f"Next slice: `{next_slice['id']}`", ""])
+    _write_projection(
+        job_dir / "features.json",
+        (json.dumps({"schema_version": 1, "features": features}, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+    )
+    _write_projection(
+        job_dir / "progress.md",
+        "\n".join(progress_lines).encode("utf-8"),
+    )
+
+
+def _validate_run_event(job_dir, events, event, event_job):
+    previous = events[-1]
+    event_type = event["type"]
+    if event_type == "RUN_STARTED":
+        if (
+            event_job.state != "BUILDING"
+            or event_job != JobRecord.model_validate(previous["data"])
+            or previous["type"] not in {"JOB_STATE_CHANGED", "JOB_RESUMED", "SLICE_PASSED"}
+            or not isinstance(event.get("run_id"), str)
+            or re.fullmatch(r"[0-9a-f]{32}", event["run_id"]) is None
+            or not isinstance(event.get("feature_id"), str)
+            or not isinstance(event.get("slice_id"), str)
+            or not isinstance(event.get("profile"), str)
+            or not event["profile"].strip()
+            or not isinstance(event.get("head_before"), str)
+            or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", event["head_before"]) is None
+            or not isinstance(event.get("plan_sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", event["plan_sha256"]) is None
+        ):
+            raise ConfigurationError("invalid slice run start event")
+        feature, item = _find_plan_slice(
+            job_dir, event["feature_id"], event["slice_id"]
+        )
+        if (
+            hashlib.sha256((job_dir / "slice-plan.json").read_bytes()).hexdigest()
+            != event["plan_sha256"]
+            or item["id"] in {
+                passed["slice_id"]
+                for passed in events
+                if passed["type"] == "SLICE_PASSED"
+            }
+        ):
+            raise ConfigurationError("slice run start does not match the approved plan")
+        task_path = event.get("task_path")
+        task_sha256 = event.get("task_sha256")
+        if (
+            not isinstance(task_path, str)
+            or task_path != f"slice-runs/{event['run_id']}/task.md"
+            or not isinstance(task_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", task_sha256) is None
+        ):
+            raise ConfigurationError("invalid slice task snapshot metadata")
+        task_file = job_dir / task_path
+        if (
+            task_file.is_symlink()
+            or not task_file.is_file()
+            or hashlib.sha256(task_file.read_bytes()).hexdigest() != task_sha256
+        ):
+            raise ConfigurationError("slice task snapshot is missing or changed")
+        if any(
+            existing["type"] == "RUN_STARTED"
+            and not any(
+                later["type"] == "RUN_FINISHED"
+                and later.get("run_id") == existing.get("run_id")
+                for later in events[index + 1 :]
+            )
+            for index, existing in enumerate(events)
+        ):
+            raise ConfigurationError("slice run started before prior run completed")
+        return
+
+    run_start = previous if previous["type"] == "RUN_STARTED" else None
+    if event_type == "RUN_FINISHED":
+        if (
+            run_start is None
+            or event_job.state != "BUILDING"
+            or event_job != JobRecord.model_validate(run_start["data"])
+            or event.get("run_id") != run_start.get("run_id")
+            or event.get("feature_id") != run_start.get("feature_id")
+            or event.get("slice_id") != run_start.get("slice_id")
+            or event.get("outcome") not in {"OK", "BUDGET", "TIMEOUT", "ERROR"}
+        ):
+            raise ConfigurationError("invalid slice run completion event")
+        if event["outcome"] == "OK":
+            if (
+                not isinstance(event.get("commit_sha"), str)
+                or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", event["commit_sha"]) is None
+                or not isinstance(event.get("handoff"), str)
+                or not event["handoff"].strip()
+                or not isinstance(event.get("test_ids"), list)
+                or event["test_ids"] != _find_plan_slice(
+                    job_dir, run_start["feature_id"], run_start["slice_id"]
+                )[1]["test_ids"]
+            ):
+                raise ConfigurationError("invalid successful slice run metadata")
+        run_dir = event.get("run_dir")
+        if run_dir is not None:
+            if (
+                not isinstance(run_dir, str)
+                or re.fullmatch(r"runs/[1-9][0-9]*", run_dir) is None
+                or (job_dir / run_dir).is_symlink()
+                or not (job_dir / run_dir).is_dir()
+            ):
+                raise ConfigurationError("invalid slice Runner diagnostic directory")
+        return
+
+    run_finished = previous if previous["type"] == "RUN_FINISHED" else None
+    if event_type == "SLICE_GATE_COMPLETED":
+        if (
+            run_finished is None
+            or run_finished.get("outcome") != "OK"
+            or event_job.state != "BUILDING"
+            or event_job != JobRecord.model_validate(run_finished["data"])
+            or event.get("run_id") != run_finished.get("run_id")
+            or event.get("outcome") not in {"PASS", "FAIL", "ERROR"}
+            or event.get("feature_id") != run_finished.get("feature_id")
+            or event.get("slice_id") != run_finished.get("slice_id")
+        ):
+            raise ConfigurationError("invalid slice Gate event")
+        report_path = event.get("report_path")
+        report_sha256 = event.get("report_sha256")
+        if event["outcome"] == "ERROR":
+            if (
+                report_path is not None
+                or report_sha256 is not None
+                or not isinstance(event.get("error"), str)
+                or not event["error"].strip()
+            ):
+                raise ConfigurationError("invalid slice Gate error metadata")
+            return
+        if (
+            not isinstance(report_path, str)
+            or re.fullmatch(r"gate/[0-9a-f-]{36}/gate-report\.json", report_path) is None
+            or not isinstance(report_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", report_sha256) is None
+        ):
+            raise ConfigurationError("invalid slice Gate report metadata")
+        report_file = job_dir / report_path
+        if (
+            report_file.is_symlink()
+            or not report_file.is_file()
+            or hashlib.sha256(report_file.read_bytes()).hexdigest() != report_sha256
+        ):
+            raise ConfigurationError("slice Gate report is missing or changed")
+        try:
+            report = json.loads(report_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeDecodeError) as error:
+            raise ConfigurationError(f"invalid slice Gate report: {error}") from error
+        run_start = events[-2]
+        if (
+            not isinstance(report, dict)
+            or report.get("verdict") != event["outcome"]
+            or report.get("slice_id") != run_start.get("slice_id")
+            or report.get("base_sha") != run_start.get("head_before")
+        ):
+            raise ConfigurationError("slice Gate report does not match its event")
+        return
+
+    if event_type == "SLICE_PASSED":
+        gate_event = previous
+        if (
+            gate_event["type"] != "SLICE_GATE_COMPLETED"
+            or gate_event.get("outcome") != "PASS"
+            or event_job.state != "BUILDING"
+            or event_job != JobRecord.model_validate(gate_event["data"])
+            or event.get("run_id") != gate_event.get("run_id")
+            or event.get("feature_id") != gate_event.get("feature_id")
+            or event.get("slice_id") != gate_event.get("slice_id")
+            or event.get("commit_sha") != events[-2].get("commit_sha")
+            or event.get("test_ids") != events[-2].get("test_ids")
+            or not isinstance(event.get("handoff"), str)
+            or not event["handoff"].strip()
+        ):
+            raise ConfigurationError("invalid slice pass event")
+        if any(
+            existing["type"] == "SLICE_PASSED"
+            and existing.get("slice_id") == event.get("slice_id")
+            for existing in events
+        ):
+            raise ConfigurationError("slice passed more than once")
+        return
+    raise ConfigurationError(f"invalid slice event type for job {event_job.job_id}")
+
+
+def _validate_slice_failure_state(job, event, previous):
+    if (
+        job.state != "BUILDING"
+        or event.get("to") != "NEEDS_HUMAN"
+        or event.get("failure_stage") not in {"initializer_script", "runner", "slice_gate"}
+        or not isinstance(event.get("failure_reason"), str)
+        or not event["failure_reason"].strip()
+        or not isinstance(event.get("slice_id"), str)
+        or previous["type"] not in {"RUN_STARTED", "RUN_FINISHED", "SLICE_GATE_COMPLETED"}
+        or event.get("slice_id") != previous.get("slice_id")
+        or (
+            previous.get("run_id") is not None
+            and event.get("run_id") != previous.get("run_id")
+        )
+    ):
+        return False
+    if event["failure_stage"] == "slice_gate":
+        return (
+            previous["type"] == "SLICE_GATE_COMPLETED"
+            and previous.get("outcome") in {"FAIL", "ERROR"}
+        )
+    if event["failure_stage"] == "runner":
+        return previous["type"] == "RUN_FINISHED" and previous.get("outcome") != "OK"
+    return previous["type"] == "RUN_FINISHED" and previous.get("failure_stage") == "initializer_script"
 
 
 def _validate_initializer_failure_event(job_dir, event, previous):
@@ -2493,3 +2844,616 @@ def list_jobs(factory_root):
             raise ConfigurationError(f"job ID does not match directory: {job_dir}")
         jobs.append(job)
     return jobs
+
+
+def _record_slice_event(job_dir, current, event_type, reason, details):
+    job = JobRecord.model_validate(current["job"])
+    event = {
+        "seq": current["last_event"]["seq"] + 1,
+        "ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "job_id": job.job_id,
+        "type": event_type,
+        "actor": getpass.getuser(),
+        "reason": reason,
+        "data": job.model_dump(mode="json"),
+        **details,
+    }
+    return _persist_event(job_dir, event, job)
+
+
+def _worktree_changes(worktree):
+    return _run_git(
+        worktree,
+        ["status", "--porcelain", "--untracked-files=all"],
+        "check slice worktree",
+    )
+
+
+def _run_init_script(job_dir, worktree, config, run_id):
+    script = worktree / ".factory" / "init.py"
+    stored_script = job_dir / "init.py"
+    if (
+        script.is_symlink()
+        or not script.is_file()
+        or stored_script.is_symlink()
+        or not stored_script.is_file()
+    ):
+        raise FactoryError("approved initializer script is missing or invalid")
+    expected_hash = hashlib.sha256(stored_script.read_bytes()).hexdigest()
+    if hashlib.sha256(script.read_bytes()).hexdigest() != expected_hash:
+        raise FactoryError("approved initializer script changed")
+
+    runs_dir = job_dir / "setup-runs"
+    if runs_dir.is_symlink() or (runs_dir.exists() and not runs_dir.is_dir()):
+        raise FactoryError("invalid initializer diagnostics directory")
+    runs_dir.mkdir(exist_ok=True)
+    attempt_dir = runs_dir / run_id
+    attempt_dir.mkdir()
+    stdout_path = attempt_dir / "stdout.txt"
+    stderr_path = attempt_dir / "stderr.txt"
+    environment = os.environ.copy()
+    from .gate import _validate_secret_env_vars
+    from .runner import _close_process_tree, _spawn_process, _terminate_process_tree
+
+    for name in _validate_secret_env_vars(config):
+        environment.pop(name, None)
+    process = None
+    exit_code = None
+    error = None
+    try:
+        with stdout_path.open("xb") as stdout, stderr_path.open("xb") as stderr:
+            try:
+                process = _spawn_process(
+                    [sys.executable, ".factory/init.py"],
+                    cwd=worktree,
+                    stdin=subprocess.DEVNULL,
+                    stdout=stdout,
+                    stderr=stderr,
+                    shell=False,
+                    env=environment,
+                )
+            except OSError as launch_error:
+                error = f"cannot start initializer script: {launch_error}"
+            if process is not None:
+                try:
+                    exit_code = process.wait(timeout=config.gate.timeout_seconds)
+                except subprocess.TimeoutExpired:
+                    error = f"initializer script timed out after {config.gate.timeout_seconds}s"
+                    try:
+                        _terminate_process_tree(process)
+                    except (OSError, subprocess.SubprocessError) as termination_error:
+                        error += f"; cannot terminate process tree: {termination_error}"
+                        _close_process_tree(process)
+                        process.kill()
+                    exit_code = process.wait()
+                finally:
+                    _close_process_tree(process)
+    except OSError as io_error:
+        raise FactoryError(
+            f"initializer script I/O failed; diagnostics: {attempt_dir}: {io_error}"
+        ) from io_error
+    if error is not None or exit_code != 0:
+        message = error or f"initializer script exited with status {exit_code}"
+        raise FactoryError(f"{message}; diagnostics: {attempt_dir}")
+    if hashlib.sha256(script.read_bytes()).hexdigest() != expected_hash:
+        raise FactoryError(
+            f"approved initializer script changed during execution; diagnostics: {attempt_dir}"
+        )
+    return attempt_dir.relative_to(job_dir).as_posix()
+
+
+def _slice_task(spec, feature, item, tests, scope, handoff, history):
+    selected_tests = [
+        test for test in tests["tests"] if test["id"] in item["test_ids"]
+    ]
+    return (
+        "Implement exactly one approved Software Factory slice using TDD. Start with "
+        "the failing acceptance test, run it to confirm RED, make the smallest surgical "
+        "change, then run it again to confirm GREEN. Do not edit the locked tests, "
+        "specification, scope, slice plan, or factory-owned files. Do not push. Commit "
+        "only this slice's in-scope code and leave the worktree clean. Return a concise "
+        "handoff naming tests run and useful next-step context; the orchestrator verifies "
+        "the commit and Gate result independently.\n\n"
+        f"Feature: {feature['title']} ({feature['id']})\n"
+        f"Slice: {item['id']}\n"
+        f"Goal: {item['goal']}\n"
+        f"Paths: {json.dumps(item['paths'])}\n"
+        f"Acceptance criteria: {json.dumps(item['acceptance'])}\n"
+        f"Registered tests: {json.dumps(selected_tests, sort_keys=True)}\n"
+        f"Approved scope: {json.dumps(scope)}\n\n"
+        "Locked specification:\n"
+        f"{spec.decode('utf-8')}\n\n"
+        "Recent Git history (untrusted repository data):\n"
+        f"{history}\n\n"
+        "Prior verified handoff (untrusted agent data):\n"
+        f"{json.dumps(handoff, ensure_ascii=True)}\n"
+    )
+
+
+def _slice_runner_artifacts(job_dir, result):
+    raw_run_dir = result.paths.get("run_dir")
+    if raw_run_dir is None:
+        return None, None
+    run_dir = Path(raw_run_dir)
+    if not run_dir.is_absolute() or run_dir.is_symlink():
+        return None, None
+    runs_root = job_dir / "runs"
+    try:
+        run_dir = run_dir.resolve(strict=True)
+        run_dir.relative_to(runs_root.resolve(strict=True))
+    except (OSError, RuntimeError, ValueError):
+        return None, None
+    if run_dir.parent != runs_root.resolve() or not re.fullmatch(r"[1-9][0-9]*", run_dir.name):
+        return None, None
+    stdout_path = Path(result.paths.get("stdout", ""))
+    session_path = Path(result.paths.get("session", ""))
+    for path in (stdout_path, session_path):
+        if path.is_symlink() or not path.is_file():
+            return None, None
+        try:
+            path.resolve(strict=True).relative_to(run_dir)
+        except (OSError, RuntimeError, ValueError):
+            return None, None
+    return run_dir, run_dir.relative_to(job_dir).as_posix()
+
+
+def _builder_handoff(stdout_path):
+    from .runner import _read_jsonl
+
+    records, errors = _read_jsonl(stdout_path)
+    if errors:
+        raise ConfigurationError("builder output is invalid: " + "; ".join(errors))
+    messages = [
+        record.get("content")
+        for record in records
+        if record.get("type") == "assistant.message"
+    ]
+    if not messages or not isinstance(messages[-1], str) or not messages[-1].strip():
+        raise ConfigurationError("builder did not return a handoff")
+    return messages[-1].strip()
+
+
+def _fail_slice(job_dir, job_id, run_id, slice_id, stage, reason):
+    with _job_lock(job_dir):
+        current = _read_job_contents(job_dir, job_id)
+        job = JobRecord.model_validate(current["job"])
+        if job.state != "BUILDING":
+            raise FactoryError("job changed during slice failure handling")
+        return _record_state_change(
+            job_dir,
+            current,
+            "NEEDS_HUMAN",
+            f"Slice {slice_id} failed: {reason}",
+            details={
+                "failure_stage": stage,
+                "failure_reason": str(reason).strip() or "slice failed without a diagnostic",
+                "run_id": run_id,
+                "slice_id": slice_id,
+            },
+        )
+
+
+def run_job(factory_root, job_id, profile_name):
+    factory_root = Path(factory_root).resolve()
+    job_id, job_dir = _job_location(factory_root, job_id)
+    config = _load_model(factory_root / "config.json", FactoryConfig)
+    if profile_name not in config.profiles:
+        raise ConfigurationError(f"unknown runner profile: {profile_name}")
+    profile = config.profiles[profile_name]
+
+    while True:
+        with _job_lock(job_dir):
+            current = _read_job_contents(job_dir, job_id)
+            job = JobRecord.model_validate(current["job"])
+            if job.state != "BUILDING":
+                raise ConfigurationError("slice run requires BUILDING")
+            if current["last_event"]["type"] == "RUN_STARTED":
+                raise FactoryError(
+                    "an interrupted slice run requires human recovery; no session was restarted"
+                )
+            _, events = _read_event_log(job_dir / "events.jsonl", job_id)
+            plan = _approved_plan(job_dir)
+            plan_event = next(
+                event
+                for event in events
+                if event["type"] == "JOB_STATE_CHANGED"
+                and event.get("from") == "TESTS_RED_OK"
+                and event.get("to") == "BUILDING"
+            )
+            plan_hash = hashlib.sha256(
+                (job_dir / "slice-plan.json").read_bytes()
+            ).hexdigest()
+            if plan_hash != plan_event.get("plan_sha256"):
+                raise ConfigurationError("approved slice plan changed")
+            scope_path = job_dir / "scope.json"
+            scope_hash = hashlib.sha256(scope_path.read_bytes()).hexdigest()
+            if scope_hash != plan_event.get("scope_sha256"):
+                raise ConfigurationError("approved scope changed")
+            from .gate import _read_scope_manifest
+
+            worktree = Path(job.worktree_path)
+            if worktree.is_symlink() or not worktree.is_dir():
+                raise ConfigurationError("slice worktree is missing or invalid")
+            scope = _read_scope_manifest(job_dir, worktree)
+            tests_written = next(
+                event
+                for event in events
+                if event["type"] == "JOB_STATE_CHANGED"
+                and event.get("to") == "TESTS_WRITTEN"
+            )
+            _, tests = _validate_registered_tests(
+                job_dir, job, tests_written["input_sha256"]
+            )
+            passed_ids = {
+                event["slice_id"]
+                for event in events
+                if event["type"] == "SLICE_PASSED"
+            }
+            pending = next(
+                (
+                    (feature, item)
+                    for feature in plan["features"]
+                    for item in feature["slices"]
+                    if item["id"] not in passed_ids
+                ),
+                None,
+            )
+            if pending is None:
+                return current
+            feature, item = pending
+            head_before = _run_git(
+                worktree, ["rev-parse", "HEAD"], "resolve slice starting commit"
+            )
+            run_id = uuid4().hex
+            handoff = next(
+                (
+                    event["handoff"]
+                    for event in reversed(events)
+                    if event["type"] == "SLICE_PASSED"
+                ),
+                "",
+            )
+            history = _run_git(
+                worktree, ["log", "-5", "--oneline"], "read recent Git history"
+            )
+            task_content = _slice_task(
+                (job_dir / "spec.md").read_bytes(),
+                feature,
+                item,
+                tests,
+                scope,
+                handoff,
+                history,
+            ).encode("utf-8")
+            attempt_dir = job_dir / "slice-runs"
+            if attempt_dir.is_symlink() or (
+                attempt_dir.exists() and not attempt_dir.is_dir()
+            ):
+                raise FactoryError("invalid slice run artifact directory")
+            attempt_dir.mkdir(exist_ok=True)
+            attempt_dir = attempt_dir / run_id
+            attempt_dir.mkdir()
+            task_snapshot = attempt_dir / "task.md"
+            _write_durable_artifact(task_snapshot, task_content)
+            start = _record_slice_event(
+                job_dir,
+                current,
+                "RUN_STARTED",
+                f"Started slice {item['id']}",
+                {
+                    "run_id": run_id,
+                    "feature_id": feature["id"],
+                    "slice_id": item["id"],
+                    "profile": profile_name,
+                    "head_before": head_before,
+                    "plan_sha256": plan_hash,
+                    "task_path": task_snapshot.relative_to(job_dir).as_posix(),
+                    "task_sha256": hashlib.sha256(task_content).hexdigest(),
+                },
+            )
+
+        task_file = worktree / ".factory" / "task.md"
+        if (
+            (worktree / ".factory").is_symlink()
+            or not (worktree / ".factory").is_dir()
+            or task_file.is_symlink()
+            or task_file.exists()
+        ):
+            _record_slice_event(
+                job_dir,
+                start,
+                "RUN_FINISHED",
+                "Slice setup failed",
+                {
+                    "run_id": run_id,
+                    "feature_id": feature["id"],
+                    "slice_id": item["id"],
+                    "outcome": "ERROR",
+                    "failure_stage": "initializer_script",
+                    "failure_reason": "builder task path is missing or already exists",
+                },
+            )
+            _fail_slice(
+                job_dir,
+                job_id,
+                run_id,
+                item["id"],
+                "initializer_script",
+                "builder task path is missing or already exists",
+            )
+            raise FactoryError("builder task path is missing or already exists")
+
+        setup_run = None
+        try:
+            if _worktree_changes(worktree):
+                raise FactoryError("slice requires a clean worktree before initialization")
+            setup_run = _run_init_script(job_dir, worktree, config, run_id)
+            if _worktree_changes(worktree):
+                raise FactoryError("initializer script changed the target worktree")
+            _write_durable_artifact(task_file, task_content)
+        except (ConfigurationError, FactoryError, OSError) as error:
+            _record_slice_event(
+                job_dir,
+                start,
+                "RUN_FINISHED",
+                "Slice setup failed",
+                {
+                    "run_id": run_id,
+                    "feature_id": feature["id"],
+                    "slice_id": item["id"],
+                    "outcome": "ERROR",
+                    "failure_stage": "initializer_script",
+                    "failure_reason": str(error),
+                    "setup_run": setup_run,
+                },
+            )
+            _fail_slice(
+                job_dir,
+                job_id,
+                run_id,
+                item["id"],
+                "initializer_script",
+                str(error),
+            )
+            raise FactoryError(
+                f"slice initializer failed and requires human attention: {error}"
+            ) from error
+
+        from .runner import run_agent
+
+        task_unchanged = False
+        try:
+            result = run_agent(
+                profile.agent,
+                profile,
+                task_file,
+                worktree,
+                f"build-{job_id[:8]}-{item['id']}",
+            )
+        except (ConfigurationError, FactoryError, OSError) as error:
+            result = None
+            runner_error = str(error)
+        finally:
+            if task_file.is_file() and not task_file.is_symlink():
+                try:
+                    task_unchanged = task_file.read_bytes() == task_content
+                    if task_unchanged:
+                        task_file.unlink()
+                except OSError:
+                    task_unchanged = False
+
+        if result is None:
+            outcome = "ERROR"
+            runner_error = runner_error or "builder Runner failed"
+            run_dir_relative = None
+            session_id = None
+        else:
+            outcome = result.outcome
+            runner_error = result.error or result.outcome
+            run_dir, run_dir_relative = _slice_runner_artifacts(job_dir, result)
+            session_id = result.session_id
+            if outcome == "OK" and run_dir is None:
+                outcome = "ERROR"
+                runner_error = "builder Runner artifacts are missing or invalid"
+
+        commit_sha = None
+        builder_handoff = None
+        if outcome == "OK":
+            try:
+                if not task_unchanged:
+                    raise FactoryError("builder changed or removed its task file")
+                if _worktree_changes(worktree):
+                    raise FactoryError("builder left uncommitted worktree changes")
+                target_script = worktree / ".factory" / "init.py"
+                expected_script_hash = hashlib.sha256(
+                    (job_dir / "init.py").read_bytes()
+                ).hexdigest()
+                if (
+                    target_script.is_symlink()
+                    or not target_script.is_file()
+                    or hashlib.sha256(target_script.read_bytes()).hexdigest()
+                    != expected_script_hash
+                ):
+                    raise FactoryError("builder changed the approved initializer script")
+                _, events = _read_event_log(job_dir / "events.jsonl", job_id)
+                tests_written = next(
+                    event
+                    for event in events
+                    if event["type"] == "JOB_STATE_CHANGED"
+                    and event.get("to") == "TESTS_WRITTEN"
+                )
+                _validate_registered_tests(
+                    job_dir,
+                    JobRecord.model_validate(start["job"]),
+                    tests_written["input_sha256"],
+                )
+                commit_sha = _run_git(
+                    worktree, ["rev-parse", "HEAD"], "resolve slice commit"
+                )
+                if commit_sha == head_before:
+                    raise FactoryError("builder did not create a slice commit")
+                builder_handoff = _builder_handoff(Path(result.paths["stdout"]))
+            except (ConfigurationError, FactoryError, OSError) as error:
+                outcome = "ERROR"
+                runner_error = str(error)
+
+        run_details = {
+            "run_id": run_id,
+            "feature_id": feature["id"],
+            "slice_id": item["id"],
+            "outcome": outcome,
+            "run_dir": run_dir_relative,
+            "session_id": session_id,
+        }
+        if outcome == "OK":
+            run_details.update(
+                {
+                    "commit_sha": commit_sha,
+                    "test_ids": item["test_ids"],
+                    "handoff": builder_handoff,
+                    "task_sha256": hashlib.sha256(task_content).hexdigest(),
+                }
+            )
+        else:
+            failure_stage = "runner"
+            run_details.update(
+                {
+                    "failure_stage": failure_stage,
+                    "failure_reason": runner_error,
+                }
+            )
+        with _job_lock(job_dir):
+            current = _read_job_contents(job_dir, job_id)
+            if (
+                current["last_event"]["type"] != "RUN_STARTED"
+                or current["last_event"].get("run_id") != run_id
+                or current["job"]["state"] != "BUILDING"
+            ):
+                raise FactoryError("job changed during builder session")
+            finished = _record_slice_event(
+                job_dir,
+                current,
+                "RUN_FINISHED",
+                "Builder session completed" if outcome == "OK" else "Builder session failed",
+                run_details,
+            )
+
+        if outcome != "OK":
+            _fail_slice(
+                job_dir,
+                job_id,
+                run_id,
+                item["id"],
+                "runner",
+                runner_error,
+            )
+            raise FactoryError(
+                f"builder session failed and requires human attention: {runner_error}"
+            )
+
+        from .gate import evaluate_gate
+
+        try:
+            gate_result = evaluate_gate(
+                factory_root,
+                job_id,
+                head_before,
+                "fast",
+                item["id"],
+            )
+        except (ConfigurationError, FactoryError, OSError) as error:
+            with _job_lock(job_dir):
+                current = _read_job_contents(job_dir, job_id)
+                if (
+                    current["job"]["state"] != "BUILDING"
+                    or current["last_event"]["type"] != "RUN_FINISHED"
+                    or current["last_event"].get("run_id") != run_id
+                ):
+                    raise FactoryError("job changed during slice Gate execution")
+                gate_event = _record_slice_event(
+                    job_dir,
+                    current,
+                    "SLICE_GATE_COMPLETED",
+                    "Slice Gate could not complete",
+                    {
+                        "run_id": run_id,
+                        "feature_id": feature["id"],
+                        "slice_id": item["id"],
+                        "outcome": "ERROR",
+                        "error": str(error),
+                    },
+                )
+            _fail_slice(
+                job_dir,
+                job_id,
+                run_id,
+                item["id"],
+                "slice_gate",
+                str(error),
+            )
+            raise FactoryError(
+                f"slice Gate failed and requires human attention: {error}"
+            ) from error
+
+        report_path = gate_result.report_path.relative_to(job_dir).as_posix()
+        outcome = gate_result.verdict
+        with _job_lock(job_dir):
+            current = _read_job_contents(job_dir, job_id)
+            if (
+                current["job"]["state"] != "BUILDING"
+                or current["last_event"]["type"] != "RUN_FINISHED"
+                or current["last_event"].get("run_id") != run_id
+            ):
+                raise FactoryError("job changed during slice Gate execution")
+            gate_event = _record_slice_event(
+                job_dir,
+                current,
+                "SLICE_GATE_COMPLETED",
+                f"Slice Gate returned {outcome}",
+                {
+                    "run_id": run_id,
+                    "feature_id": feature["id"],
+                    "slice_id": item["id"],
+                    "outcome": outcome,
+                    "report_path": report_path,
+                    "report_sha256": hashlib.sha256(
+                        gate_result.report_path.read_bytes()
+                    ).hexdigest(),
+                },
+            )
+        if outcome != "PASS":
+            _fail_slice(
+                job_dir,
+                job_id,
+                run_id,
+                item["id"],
+                "slice_gate",
+                f"Gate report: {report_path}",
+            )
+            raise FactoryError(
+                f"slice Gate failed; diagnostics: {gate_result.report_path.parent}"
+            )
+        with _job_lock(job_dir):
+            current = _read_job_contents(job_dir, job_id)
+            if (
+                current["job"]["state"] != "BUILDING"
+                or current["last_event"]["type"] != "SLICE_GATE_COMPLETED"
+                or current["last_event"].get("run_id") != run_id
+                or current["last_event"].get("outcome") != "PASS"
+            ):
+                raise FactoryError("job changed before recording slice pass")
+            _record_slice_event(
+                job_dir,
+                current,
+                "SLICE_PASSED",
+                f"Slice {item['id']} passed",
+                {
+                    "run_id": run_id,
+                    "feature_id": feature["id"],
+                    "slice_id": item["id"],
+                    "commit_sha": commit_sha,
+                    "test_ids": item["test_ids"],
+                    "handoff": builder_handoff,
+                    "report_path": report_path,
+                },
+            )
