@@ -1,7 +1,7 @@
 # Software Factory
 
-Projektová kostra pro postupnou implementaci aplikace Software Factory.
+Python CLI pro řízení vývojových jobů s Copilot CLI. Umožňuje připravit a spouštět
+joby, spravovat jejich stav a kontrolovat změny pomocí gate.
 
-Dokumentaci soustřeď do složky [docs/](docs/README.md). Stávající úvodní popis
-aplikace je zatím v kořenovém souboru [design.md](design.md).
-Zatím neobsahuje implementační kód.
+- [Návrh aplikace](design.md)
+- [Dokumentace](docs/README.md)
