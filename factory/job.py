@@ -11,6 +11,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Literal
 from uuid import UUID, uuid4
 
@@ -328,6 +329,17 @@ def _worktree_path(factory_root, job):
     return project_worktrees / job.job_id
 
 
+def _replace_with_retry(source, destination):
+    for attempt in range(5):
+        try:
+            os.replace(source, destination)
+            return
+        except OSError as error:
+            if getattr(error, "winerror", None) not in {5, 32, 33} or attempt == 4:
+                raise
+            time.sleep(0.02 * 2**attempt)
+
+
 def _write_snapshot(path, job):
     with tempfile.NamedTemporaryFile(
         mode="w",
@@ -344,7 +356,7 @@ def _write_snapshot(path, job):
         os.fsync(temporary.fileno())
         temporary_path = Path(temporary.name)
     try:
-        os.replace(temporary_path, path)
+        _replace_with_retry(temporary_path, path)
     finally:
         temporary_path.unlink(missing_ok=True)
 
@@ -758,6 +770,16 @@ def _read_event_log(path, job_id):
                     and job.state == "TESTS_RED_OK"
                     and event_job.state == "BUILDING"
                 )
+                is_gate_entry = (
+                    event["type"] == "JOB_STATE_CHANGED"
+                    and job.state == "BUILDING"
+                    and event_job.state == "GATE"
+                )
+                is_final_review = (
+                    event["type"] == "JOB_STATE_CHANGED"
+                    and job.state == "GATE"
+                    and event_job.state == "REVIEW"
+                )
                 is_initializer_failure = (
                     event["type"] == "JOB_STATE_CHANGED"
                     and job.state == "TESTS_RED_OK"
@@ -767,6 +789,12 @@ def _read_event_log(path, job_id):
                 is_slice_failure = (
                     event["type"] == "JOB_STATE_CHANGED"
                     and _validate_slice_failure_state(job, event, events[-1])
+                )
+                is_final_gate_failure = (
+                    event["type"] == "JOB_STATE_CHANGED"
+                    and job.state == "GATE"
+                    and event_job.state == "NEEDS_HUMAN"
+                    and event.get("failure_stage") == "final_gate"
                 )
                 has_input_metadata = any(
                     key in event for key in ("input_path", "input_sha256")
@@ -855,6 +883,56 @@ def _read_event_log(path, job_id):
                             f"invalid slice plan metadata for job {job_id}"
                         )
                     _validate_approved_plan_artifacts(path.parent, event)
+                elif is_gate_entry:
+                    if events[-1]["type"] != "SLICE_PASSED":
+                        raise ConfigurationError(
+                            f"final Gate started without a completed slice for job {job_id}"
+                        )
+                    _validate_all_slices_passed(path.parent, events)
+                elif is_final_review:
+                    final_gate = events[-1]
+                    if (
+                        final_gate["type"] != "FINAL_GATE_COMPLETED"
+                        or final_gate.get("outcome") != "PASS"
+                        or event.get("final_gate_report_path")
+                        != final_gate.get("report_path")
+                        or event.get("final_gate_report_sha256")
+                        != final_gate.get("report_sha256")
+                    ):
+                        raise ConfigurationError(
+                            f"review state requires a passing final Gate for job {job_id}"
+                        )
+                elif is_final_gate_failure:
+                    started = next(
+                        (
+                            existing
+                            for existing in reversed(events)
+                            if existing["type"] == "FINAL_GATE_STARTED"
+                        ),
+                        None,
+                    )
+                    completed = next(
+                        (
+                            existing
+                            for existing in reversed(events)
+                            if existing["type"] == "FINAL_GATE_COMPLETED"
+                        ),
+                        None,
+                    )
+                    if (
+                        started is None
+                        or (
+                            completed is not None
+                            and completed["outcome"] == "PASS"
+                        )
+                        or event.get("final_gate_attempt_id")
+                        != started["attempt_id"]
+                        or not isinstance(event.get("failure_reason"), str)
+                        or not event["failure_reason"].strip()
+                    ):
+                        raise ConfigurationError(
+                            f"invalid final Gate failure event for job {job_id}"
+                        )
                 elif is_slice_failure:
                     if (
                         has_input_metadata
@@ -894,6 +972,8 @@ def _read_event_log(path, job_id):
                 "SLICE_PASSED",
             }:
                 _validate_run_event(path.parent, events, event, event_job)
+            elif event["type"] in {"FINAL_GATE_STARTED", "FINAL_GATE_COMPLETED"}:
+                _validate_final_gate_event(path.parent, events, event, event_job)
             elif event["type"] == "INITIALIZER_RUN_STARTED":
                 if (
                     job.state != "TESTS_RED_OK"
@@ -1236,7 +1316,7 @@ def register_spec(factory_root, job_id, spec_path, approved):
                     temporary.write(content)
                     temporary.flush()
                     os.fsync(temporary.fileno())
-                os.replace(temporary_path, stored_spec)
+                _replace_with_retry(temporary_path, stored_spec)
             finally:
                 if temporary_path is not None:
                     temporary_path.unlink(missing_ok=True)
@@ -1359,7 +1439,7 @@ def register_tests(factory_root, job_id, manifest_path, approved):
                         temporary.write(normalized_content)
                         temporary.flush()
                         os.fsync(temporary.fileno())
-                    os.replace(temporary_path, stored_tests)
+                    _replace_with_retry(temporary_path, stored_tests)
                 finally:
                     if temporary_path is not None:
                         temporary_path.unlink(missing_ok=True)
@@ -1664,7 +1744,7 @@ def _write_projection(path, content):
             temporary.write(content)
             temporary.flush()
             os.fsync(temporary.fileno())
-        os.replace(temporary_path, path)
+        _replace_with_retry(temporary_path, path)
     except OSError as error:
         raise FactoryError(f"cannot write {path.name} projection: {error}") from error
     finally:
@@ -1738,6 +1818,27 @@ def _write_job_projections(job_dir, events):
         progress_lines.extend(["All planned slices have passed.", ""])
     else:
         progress_lines.extend([f"Next slice: `{next_slice['id']}`", ""])
+    final_gate_event = next(
+        (
+            event
+            for event in reversed(events)
+            if event["type"] in {"FINAL_GATE_STARTED", "FINAL_GATE_COMPLETED"}
+        ),
+        None,
+    )
+    if final_gate_event is not None:
+        progress_lines.extend(
+            [
+                f"Final Gate: {final_gate_event['type'].removeprefix('FINAL_GATE_')}"
+                + (
+                    f" ({final_gate_event['outcome']})"
+                    if "outcome" in final_gate_event
+                    else ""
+                ),
+                "",
+            ]
+        )
+    progress_lines.extend([f"Job state: {events[-1]['data']['state']}", ""])
     _write_projection(
         job_dir / "features.json",
         (json.dumps({"schema_version": 1, "features": features}, indent=2, sort_keys=True) + "\n").encode("utf-8"),
@@ -1920,6 +2021,98 @@ def _validate_run_event(job_dir, events, event, event_job):
             raise ConfigurationError("slice passed more than once")
         return
     raise ConfigurationError(f"invalid slice event type for job {event_job.job_id}")
+
+
+def _validate_all_slices_passed(job_dir, events):
+    plan = _approved_plan(job_dir)
+    expected_ids = {
+        item["id"]
+        for feature in plan["features"]
+        for item in feature["slices"]
+    }
+    passed_ids = [
+        event["slice_id"]
+        for event in events
+        if event["type"] == "SLICE_PASSED"
+    ]
+    if len(passed_ids) != len(expected_ids) or set(passed_ids) != expected_ids:
+        raise ConfigurationError("final Gate requires every approved slice to pass")
+
+
+def _validate_final_gate_event(job_dir, events, event, event_job):
+    previous = events[-1]
+    if event["type"] == "FINAL_GATE_STARTED":
+        if (
+            event_job.state != "GATE"
+            or event_job != JobRecord.model_validate(previous["data"])
+            or previous["type"] != "JOB_STATE_CHANGED"
+            or previous.get("from") != "BUILDING"
+            or previous.get("to") != "GATE"
+            or not isinstance(event.get("attempt_id"), str)
+            or re.fullmatch(r"[0-9a-f]{32}", event["attempt_id"]) is None
+            or not isinstance(event.get("base_sha"), str)
+            or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", event["base_sha"]) is None
+            or event.get("base_sha") != event_job.work_branch_start_sha
+            or event.get("mode") != "full"
+        ):
+            raise ConfigurationError("invalid final Gate start event")
+        _validate_all_slices_passed(job_dir, events)
+        if any(
+            existing["type"] in {"FINAL_GATE_STARTED", "FINAL_GATE_COMPLETED"}
+            for existing in events
+        ):
+            raise ConfigurationError("final Gate was already started")
+        return
+
+    start = previous
+    if (
+        start["type"] != "FINAL_GATE_STARTED"
+        or event_job.state != "GATE"
+        or event_job != JobRecord.model_validate(start["data"])
+        or event.get("attempt_id") != start.get("attempt_id")
+        or event.get("base_sha") != start.get("base_sha")
+        or not isinstance(event.get("outcome"), str)
+        or event["outcome"] not in {"PASS", "FAIL", "ERROR"}
+    ):
+        raise ConfigurationError("invalid final Gate completion event")
+    if event["outcome"] == "ERROR":
+        if (
+            event.get("report_path") is not None
+            or event.get("report_sha256") is not None
+            or not isinstance(event.get("error"), str)
+            or not event["error"].strip()
+        ):
+            raise ConfigurationError("invalid final Gate error metadata")
+        return
+    report_path = event.get("report_path")
+    report_sha256 = event.get("report_sha256")
+    if (
+        not isinstance(report_path, str)
+        or re.fullmatch(r"gate/[0-9a-f-]{36}/gate-report\.json", report_path) is None
+        or not isinstance(report_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", report_sha256) is None
+    ):
+        raise ConfigurationError("invalid final Gate report metadata")
+    report_file = job_dir / report_path
+    if (
+        report_file.is_symlink()
+        or not report_file.is_file()
+        or hashlib.sha256(report_file.read_bytes()).hexdigest() != report_sha256
+    ):
+        raise ConfigurationError("final Gate report is missing or changed")
+    try:
+        report = json.loads(report_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError) as error:
+        raise ConfigurationError(f"invalid final Gate report: {error}") from error
+    if (
+        not isinstance(report, dict)
+        or report.get("job_id") != event_job.job_id
+        or report.get("base_sha") != event.get("base_sha")
+        or report.get("mode") != "full"
+        or report.get("slice_id") is not None
+        or report.get("verdict") != event["outcome"]
+    ):
+        raise ConfigurationError("final Gate report does not match its event")
 
 
 def _validate_slice_failure_state(job, event, previous):
@@ -3200,6 +3393,193 @@ def _complete_slice_gate(
         )
 
 
+def _record_final_gate_event(job_dir, current, event_type, reason, details):
+    job = JobRecord.model_validate(current["job"])
+    event = {
+        "seq": current["last_event"]["seq"] + 1,
+        "ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "job_id": job.job_id,
+        "type": event_type,
+        "actor": getpass.getuser(),
+        "reason": reason,
+        "data": job.model_dump(mode="json"),
+        **details,
+    }
+    return _persist_event(job_dir, event, job)
+
+
+def _fail_final_gate(job_dir, job_id, reason):
+    with _job_lock(job_dir):
+        current = _read_job_contents(job_dir, job_id)
+        if current["job"]["state"] != "GATE":
+            raise FactoryError("job changed during final Gate failure handling")
+        _, events = _read_event_log(job_dir / "events.jsonl", job_id)
+        started = next(
+            event for event in reversed(events)
+            if event["type"] == "FINAL_GATE_STARTED"
+        )
+        completed = next(
+            (
+                event
+                for event in reversed(events)
+                if event["type"] == "FINAL_GATE_COMPLETED"
+            ),
+            None,
+        )
+        if completed is not None and completed["outcome"] == "PASS":
+            raise FactoryError("passing final Gate cannot be marked as failed")
+        _record_state_change(
+            job_dir,
+            current,
+            "NEEDS_HUMAN",
+            f"Final Gate requires human attention: {reason}",
+            details={
+                "failure_stage": "final_gate",
+                "failure_reason": str(reason).strip() or "final Gate failed",
+                "final_gate_attempt_id": started["attempt_id"],
+            },
+        )
+    raise FactoryError(f"final Gate failed and requires human attention: {reason}")
+
+
+def _complete_final_gate(factory_root, job_dir, job_id):
+    from .gate import evaluate_gate
+
+    with _job_lock(job_dir):
+        current = _read_job_contents(job_dir, job_id)
+        job = JobRecord.model_validate(current["job"])
+        if job.state == "REVIEW":
+            return current
+        if job.state != "GATE":
+            raise ConfigurationError("final Gate requires GATE")
+        _, events = _read_event_log(job_dir / "events.jsonl", job_id)
+        completed = next(
+            (
+                event
+                for event in reversed(events)
+                if event["type"] == "FINAL_GATE_COMPLETED"
+            ),
+            None,
+        )
+        started = next(
+            (
+                event
+                for event in reversed(events)
+                if event["type"] == "FINAL_GATE_STARTED"
+            ),
+            None,
+        )
+        if completed is not None:
+            if completed["outcome"] != "PASS":
+                failure_reason = completed.get("error") or (
+                    f"Gate report: {completed.get('report_path')}"
+                )
+            else:
+                _record_state_change(
+                    job_dir,
+                    current,
+                    "REVIEW",
+                    "Final Gate passed",
+                    details={
+                        "final_gate_report_path": completed["report_path"],
+                        "final_gate_report_sha256": completed["report_sha256"],
+                    },
+                )
+                return _read_job_contents(job_dir, job_id)
+        elif started is not None:
+            failure_reason = "final Gate was interrupted; automatic retry is not allowed"
+        else:
+            _validate_all_slices_passed(job_dir, events)
+            attempt_id = uuid4().hex
+            base_sha = job.work_branch_start_sha
+            _record_final_gate_event(
+                job_dir,
+                current,
+                "FINAL_GATE_STARTED",
+                "Started final full Gate",
+                {
+                    "attempt_id": attempt_id,
+                    "base_sha": base_sha,
+                    "mode": "full",
+                },
+            )
+            failure_reason = None
+
+    if failure_reason is not None:
+        _fail_final_gate(job_dir, job_id, failure_reason)
+
+    try:
+        gate_result = evaluate_gate(
+            factory_root,
+            job_id,
+            base_sha,
+            "full",
+        )
+    except (ConfigurationError, FactoryError, OSError) as error:
+        with _job_lock(job_dir):
+            current = _read_job_contents(job_dir, job_id)
+            if (
+                current["job"]["state"] != "GATE"
+                or current["last_event"]["type"] != "FINAL_GATE_STARTED"
+                or current["last_event"].get("attempt_id") != attempt_id
+            ):
+                raise FactoryError("job changed during final Gate execution")
+            _record_final_gate_event(
+                job_dir,
+                current,
+                "FINAL_GATE_COMPLETED",
+                "Final Gate could not complete",
+                {
+                    "attempt_id": attempt_id,
+                    "base_sha": base_sha,
+                    "outcome": "ERROR",
+                    "error": str(error),
+                },
+            )
+        _fail_final_gate(job_dir, job_id, str(error))
+
+    report_path = gate_result.report_path.relative_to(job_dir).as_posix()
+    report_sha256 = hashlib.sha256(gate_result.report_path.read_bytes()).hexdigest()
+    with _job_lock(job_dir):
+        current = _read_job_contents(job_dir, job_id)
+        if (
+            current["job"]["state"] != "GATE"
+            or current["last_event"]["type"] != "FINAL_GATE_STARTED"
+            or current["last_event"].get("attempt_id") != attempt_id
+        ):
+            raise FactoryError("job changed during final Gate execution")
+        completed = _record_final_gate_event(
+            job_dir,
+            current,
+            "FINAL_GATE_COMPLETED",
+            f"Final Gate returned {gate_result.verdict}",
+            {
+                "attempt_id": attempt_id,
+                "base_sha": base_sha,
+                "outcome": gate_result.verdict,
+                "report_path": report_path,
+                "report_sha256": report_sha256,
+            },
+        )
+        if gate_result.verdict == "PASS":
+            return _record_state_change(
+                job_dir,
+                completed,
+                "REVIEW",
+                "Final Gate passed",
+                details={
+                    "final_gate_report_path": report_path,
+                    "final_gate_report_sha256": report_sha256,
+                },
+            )
+
+    _fail_final_gate(
+        job_dir,
+        job_id,
+        f"Gate report: {gate_result.report_path.parent}",
+    )
+
+
 def run_job(factory_root, job_id, profile_name):
     factory_root = Path(factory_root).resolve()
     job_id, job_dir = _job_location(factory_root, job_id)
@@ -3207,6 +3587,15 @@ def run_job(factory_root, job_id, profile_name):
     if profile_name not in config.profiles:
         raise ConfigurationError(f"unknown runner profile: {profile_name}")
     profile = config.profiles[profile_name]
+    with _job_lock(job_dir):
+        current = _read_job_contents(job_dir, job_id)
+        state = current["job"]["state"]
+    if state == "GATE":
+        return _complete_final_gate(factory_root, job_dir, job_id)
+    if state == "REVIEW":
+        return current
+    if state != "BUILDING":
+        raise ConfigurationError("slice run requires BUILDING or GATE")
 
     while True:
         recovery_to_gate = None
@@ -3214,6 +3603,8 @@ def run_job(factory_root, job_id, profile_name):
         with _job_lock(job_dir):
             current = _read_job_contents(job_dir, job_id)
             job = JobRecord.model_validate(current["job"])
+            if job.state == "REVIEW":
+                return current
             if job.state != "BUILDING":
                 raise ConfigurationError("slice run requires BUILDING")
             _, events = _read_event_log(job_dir / "events.jsonl", job_id)
@@ -3290,7 +3681,13 @@ def run_job(factory_root, job_id, profile_name):
                     _require_human_slice_recovery(
                         job_dir, current, "incomplete run has no pending slice"
                     )
-                return current
+                _record_state_change(
+                    job_dir,
+                    current,
+                    "GATE",
+                    "All approved slices passed; starting final Gate",
+                )
+                break
             feature, item = pending
             if unfinished_runs:
                 run_started = unfinished_runs[0]
@@ -3723,3 +4120,5 @@ def run_job(factory_root, job_id, profile_name):
             commit_sha,
             builder_handoff,
         )
+
+    return _complete_final_gate(factory_root, job_dir, job_id)

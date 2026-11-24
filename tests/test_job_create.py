@@ -8,7 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import patch
 
 from factory import job as job_service
@@ -191,11 +191,12 @@ class JobCreateCliTests(unittest.TestCase):
             "mode = parser.add_mutually_exclusive_group(required=True)\n"
             "mode.add_argument('--red', action='store_true')\n"
             "mode.add_argument('--fast', action='store_true')\n"
-            "parser.add_argument('--manifest', required=True)\n"
+            "mode.add_argument('--full', action='store_true')\n"
+            "parser.add_argument('--manifest')\n"
             "parser.add_argument('--baseline-sha')\n"
             "args = parser.parse_args()\n"
-            "manifest = Path(args.manifest).read_bytes()\n"
-            "tests = json.loads(manifest)['tests']\n"
+            "manifest = Path(args.manifest).read_bytes() if args.manifest else b''\n"
+            "tests = json.loads(manifest)['tests'] if manifest else []\n"
             "if os.environ.get('FACTORY_TEST_MUTATE_INPUT'):\n"
             "    Path(tests[0]['path']).write_text('modified\\n', encoding='utf-8')\n"
             "if args.red:\n"
@@ -211,7 +212,13 @@ class JobCreateCliTests(unittest.TestCase):
             "'tests': [{'id': test['id'], 'outcome': outcome} "
             "for test in tests]}\n"
             "else:\n"
-            "    outcome = os.environ.get('FACTORY_TEST_FAST_OUTCOME', 'PASS')\n"
+            "    if args.full and os.environ.get('FACTORY_TEST_FULL_COUNTER'):\n"
+            "        with open(os.environ['FACTORY_TEST_FULL_COUNTER'], 'a', "
+            "encoding='utf-8') as counter:\n"
+            "            counter.write('full\\n')\n"
+            "    outcome = os.environ.get("
+            "'FACTORY_TEST_FULL_OUTCOME' if args.full else "
+            "'FACTORY_TEST_FAST_OUTCOME', 'PASS')\n"
             "    report = {"
             "'schema_version': 1, "
             "'checks': [{'name': 'selected-tests', "
@@ -383,6 +390,40 @@ class JobCreateCliTests(unittest.TestCase):
                         ["job", "initialize", job_id, "--profile", "initializer-test"]
                     )
         return exit_code, output.getvalue()
+
+    def _prepare_building_job(self, temp_root):
+        (
+            factory_root,
+            target_repo,
+            env,
+            job_id,
+            _plan,
+            _init_script,
+            initializer_result,
+        ) = self._prepare_initializer_job(temp_root)
+        initialized, output = self._run_initializer(
+            factory_root, job_id, initializer_result
+        )
+        self.assertEqual(initialized, 0, output)
+        init_event = json.loads(output)["last_event"]
+        job_dir = factory_root / "jobs" / job_id
+        approved = self._run_cli(
+            factory_root,
+            env,
+            "job",
+            "prepare",
+            job_id,
+            "--stage",
+            "plan",
+            "--path",
+            str(job_dir / init_event["plan_path"]),
+            "--init-script",
+            str(job_dir / init_event["init_script_path"]),
+            "--approve",
+        )
+        self.assertEqual(approved.returncode, 0, approved.stderr)
+        worktree = Path(json.loads(approved.stdout)["job"]["worktree_path"])
+        return factory_root, target_repo, env, job_id, job_dir, worktree
 
     def _commit_acceptance_slice(self, job_dir, runner_calls):
         def commit_slice(role, profile, task_file, cwd, session_name):
@@ -1120,7 +1161,7 @@ class JobCreateCliTests(unittest.TestCase):
             self.assertEqual(exit_code, 0, output.getvalue())
             self.assertEqual(len(runner_calls), 2)
             status = job_service.read_job(factory_root, job_id)
-            self.assertEqual(status["job"]["state"], "BUILDING")
+            self.assertEqual(status["job"]["state"], "REVIEW")
             events = [
                 json.loads(line)
                 for line in (job_dir / "events.jsonl")
@@ -1161,6 +1202,202 @@ class JobCreateCliTests(unittest.TestCase):
                     text=True,
                 ).stdout,
                 "",
+            )
+
+    def test_run_escalates_when_final_full_gate_fails(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (
+                factory_root,
+                _target_repo,
+                env,
+                job_id,
+                job_dir,
+                _worktree,
+            ) = self._prepare_building_job(Path(temp_dir))
+            runner_calls = []
+            commit_slice = self._commit_acceptance_slice(job_dir, runner_calls)
+            full_counter = Path(temp_dir) / "full-checks.txt"
+            command = ["job", "run", job_id, "--profile", "initializer-test"]
+
+            with patch("factory.cli.Path.cwd", return_value=factory_root):
+                with patch("factory.runner.run_agent", side_effect=commit_slice):
+                    with patch.dict(
+                        os.environ,
+                        {
+                            "FACTORY_TEST_FULL_COUNTER": str(full_counter),
+                            "FACTORY_TEST_FULL_OUTCOME": "FAIL",
+                        },
+                    ):
+                        output = io.StringIO()
+                        with redirect_stdout(output):
+                            exit_code = cli_main(command)
+
+            self.assertEqual(exit_code, 1, output.getvalue())
+            self.assertEqual(len(runner_calls), 1)
+            self.assertEqual(full_counter.read_text(encoding="utf-8"), "full\n")
+            events = [
+                json.loads(line)
+                for line in (job_dir / "events.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            status = job_service.read_job(factory_root, job_id)
+            self.assertEqual(status["job"]["state"], "NEEDS_HUMAN")
+            self.assertEqual(status["last_event"]["failure_stage"], "final_gate")
+            gate_events = [
+                event for event in events if event["type"] == "FINAL_GATE_COMPLETED"
+            ]
+            self.assertEqual(len(gate_events), 1)
+            self.assertEqual(gate_events[0]["outcome"], "FAIL")
+            report_path = job_dir / gate_events[0]["report_path"]
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(report["mode"], "full")
+            self.assertEqual(report["verdict"], "FAIL")
+
+    def test_run_recovers_passing_final_gate_without_running_it_twice(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (
+                factory_root,
+                _target_repo,
+                _env,
+                job_id,
+                job_dir,
+                _worktree,
+            ) = self._prepare_building_job(Path(temp_dir))
+            runner_calls = []
+            commit_slice = self._commit_acceptance_slice(job_dir, runner_calls)
+            full_counter = Path(temp_dir) / "full-checks.txt"
+            command = ["job", "run", job_id, "--profile", "initializer-test"]
+            record_state_change = job_service._record_state_change
+
+            def interrupt_before_review(
+                target_dir, current, target, reason, **kwargs
+            ):
+                if target == "REVIEW":
+                    raise OSError("simulated interruption before review transition")
+                return record_state_change(
+                    target_dir, current, target, reason, **kwargs
+                )
+
+            with patch("factory.cli.Path.cwd", return_value=factory_root):
+                with patch("factory.runner.run_agent", side_effect=commit_slice):
+                    with patch("factory.job._record_state_change", side_effect=interrupt_before_review):
+                        with patch.dict(
+                            os.environ,
+                            {
+                                "FACTORY_TEST_FULL_COUNTER": str(full_counter),
+                                "FACTORY_TEST_FULL_OUTCOME": "PASS",
+                            },
+                        ):
+                            output = io.StringIO()
+                            with redirect_stdout(output):
+                                first_exit = cli_main(command)
+
+            self.assertEqual(first_exit, 1)
+            self.assertEqual(len(runner_calls), 1)
+            self.assertEqual(full_counter.read_text(encoding="utf-8"), "full\n")
+            events = [
+                json.loads(line)
+                for line in (job_dir / "events.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            gate_events = [
+                event for event in events if event["type"] == "FINAL_GATE_COMPLETED"
+            ]
+            self.assertEqual(len(gate_events), 1)
+            self.assertEqual(gate_events[0]["outcome"], "PASS")
+            self.assertEqual(gate_events[0]["data"]["state"], "GATE")
+            self.assertEqual(
+                job_service.read_job(factory_root, job_id)["job"]["state"],
+                "GATE",
+            )
+
+            with patch("factory.cli.Path.cwd", return_value=factory_root):
+                with patch(
+                    "factory.runner.run_agent",
+                    side_effect=AssertionError("completed build must not restart"),
+                ):
+                    with patch(
+                        "factory.gate.evaluate_gate",
+                        side_effect=AssertionError("completed final Gate must not rerun"),
+                    ):
+                        output = io.StringIO()
+                        with redirect_stdout(output):
+                            recovered_exit = cli_main(command)
+
+            self.assertEqual(recovered_exit, 0, output.getvalue())
+            self.assertEqual(len(runner_calls), 1)
+            self.assertEqual(full_counter.read_text(encoding="utf-8"), "full\n")
+            status = job_service.read_job(factory_root, job_id)
+            self.assertEqual(status["job"]["state"], "REVIEW")
+            self.assertEqual(status["last_event"]["type"], "JOB_STATE_CHANGED")
+            self.assertEqual(status["last_event"]["final_gate_report_path"], gate_events[0]["report_path"])
+            progress = (job_dir / "progress.md").read_text(encoding="utf-8")
+            self.assertIn("Final Gate: COMPLETED (PASS)", progress)
+            self.assertIn("Job state: REVIEW", progress)
+
+    def test_run_escalates_interrupted_final_gate_without_retry(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (
+                factory_root,
+                _target_repo,
+                _env,
+                job_id,
+                job_dir,
+                _worktree,
+            ) = self._prepare_building_job(Path(temp_dir))
+            runner_calls = []
+            commit_slice = self._commit_acceptance_slice(job_dir, runner_calls)
+            command = ["job", "run", job_id, "--profile", "initializer-test"]
+            from factory.gate import evaluate_gate
+
+            def interrupt_final_gate(*args, **kwargs):
+                if args[3] == "full":
+                    raise KeyboardInterrupt
+                return evaluate_gate(*args, **kwargs)
+
+            with patch("factory.cli.Path.cwd", return_value=factory_root):
+                with patch("factory.job._write_job_projections"):
+                    with patch("factory.runner.run_agent", side_effect=commit_slice):
+                        with patch(
+                            "factory.gate.evaluate_gate",
+                            side_effect=interrupt_final_gate,
+                        ):
+                            with self.assertRaises(KeyboardInterrupt):
+                                cli_main(command)
+
+            self.assertEqual(len(runner_calls), 1)
+            events = [
+                json.loads(line)
+                for line in (job_dir / "events.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertEqual(events[-1]["type"], "FINAL_GATE_STARTED")
+
+            with patch("factory.cli.Path.cwd", return_value=factory_root):
+                with patch("factory.job._write_job_projections"):
+                    with patch(
+                        "factory.gate.evaluate_gate",
+                        side_effect=AssertionError("interrupted final Gate must not rerun"),
+                    ):
+                        output = io.StringIO()
+                        with redirect_stdout(output):
+                            exit_code = cli_main(command)
+
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(len(runner_calls), 1)
+            events = [
+                json.loads(line)
+                for line in (job_dir / "events.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertEqual(events[-1]["data"]["state"], "NEEDS_HUMAN")
+            self.assertEqual(events[-1]["failure_stage"], "final_gate")
+            self.assertFalse(
+                any(event["type"] == "FINAL_GATE_COMPLETED" for event in events)
             )
 
     def test_run_regates_a_committed_slice_without_restarting_runner(self):
@@ -1263,8 +1500,8 @@ class JobCreateCliTests(unittest.TestCase):
             self.assertEqual(recovered_exit, 0, output.getvalue())
             self.assertEqual(len(runner_calls), 1)
             recovered = job_service.read_job(factory_root, job_id)
-            self.assertEqual(recovered["last_event"]["type"], "SLICE_PASSED")
-            self.assertEqual(recovered["job"]["state"], "BUILDING")
+            self.assertEqual(recovered["last_event"]["type"], "JOB_STATE_CHANGED")
+            self.assertEqual(recovered["job"]["state"], "REVIEW")
             self.assertEqual(
                 [event["type"] for event in events].count("RUN_STARTED"),
                 1,
@@ -1334,7 +1571,8 @@ class JobCreateCliTests(unittest.TestCase):
             self.assertEqual(recovered_exit, 0, output.getvalue())
             self.assertEqual(len(runner_calls), 1)
             recovered = job_service.read_job(factory_root, job_id)
-            self.assertEqual(recovered["last_event"]["type"], "SLICE_PASSED")
+            self.assertEqual(recovered["last_event"]["type"], "JOB_STATE_CHANGED")
+            self.assertEqual(recovered["job"]["state"], "REVIEW")
             self.assertEqual(
                 sum(event["type"] == "RUN_STARTED" for event in events), 1
             )
@@ -1421,6 +1659,13 @@ class JobCreateCliTests(unittest.TestCase):
             self.assertIn("pending", (job_dir / "progress.md").read_text(encoding="utf-8"))
 
             output = io.StringIO()
+            from factory.gate import evaluate_gate
+
+            def reject_slice_regate(*args, **kwargs):
+                if args[3] == "fast":
+                    raise AssertionError("recovery must not rerun the slice Gate")
+                return evaluate_gate(*args, **kwargs)
+
             with patch("factory.cli.Path.cwd", return_value=factory_root):
                 with patch(
                     "factory.runner.run_agent",
@@ -1428,7 +1673,7 @@ class JobCreateCliTests(unittest.TestCase):
                 ):
                     with patch(
                         "factory.gate.evaluate_gate",
-                        side_effect=AssertionError("recovery must not rerun the Gate"),
+                        side_effect=reject_slice_regate,
                     ):
                         with redirect_stdout(output):
                             recovered_exit = cli_main(command)
@@ -1436,7 +1681,15 @@ class JobCreateCliTests(unittest.TestCase):
             self.assertEqual(recovered_exit, 0, output.getvalue())
             self.assertEqual(len(runner_calls), 1)
             recovered = job_service.read_job(factory_root, job_id)
-            self.assertEqual(recovered["last_event"]["type"], "SLICE_PASSED")
+            self.assertEqual(recovered["last_event"]["type"], "JOB_STATE_CHANGED")
+            self.assertEqual(recovered["job"]["state"], "REVIEW")
+            recovered_events = [
+                json.loads(line)
+                for line in (job_dir / "events.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertIn("SLICE_PASSED", [event["type"] for event in recovered_events])
             features = json.loads((job_dir / "features.json").read_text(encoding="utf-8"))
             self.assertTrue(features["features"][0]["slices"][0]["passes"])
 
@@ -1620,6 +1873,42 @@ class JobCreateCliTests(unittest.TestCase):
             self.assertEqual(job["worktree_status"], "not_attached")
             self.assertEqual(events[0]["type"], "JOB_CREATED")
             self.assertFalse((factory_root / "worktrees").exists())
+
+    def test_new_retries_transient_windows_snapshot_replace_failure(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            factory_root, target_repo, _ = self._prepare_repositories(Path(temp_dir))
+            output = io.StringIO()
+            error_output = io.StringIO()
+            real_replace = os.replace
+            attempts = 0
+
+            def replace_with_transient_failure(source, destination):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    error = PermissionError(5, "Access is denied")
+                    error.winerror = 5
+                    raise error
+                return real_replace(source, destination)
+
+            with patch("factory.cli.Path.cwd", return_value=factory_root):
+                with patch.object(
+                    job_service.os, "replace", side_effect=replace_with_transient_failure
+                ):
+                    with redirect_stdout(output), redirect_stderr(error_output):
+                        exit_code = cli_main(
+                            [
+                                "job",
+                                "new",
+                                "--project",
+                                str(target_repo),
+                                "--title",
+                                "Repair widget",
+                            ]
+                        )
+
+            self.assertEqual(exit_code, 0, error_output.getvalue())
+            self.assertEqual(attempts, 2)
 
     def test_prepare_approved_spec_records_hash_and_advances_state(self):
         with tempfile.TemporaryDirectory() as temp_dir:

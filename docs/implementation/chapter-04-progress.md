@@ -1,6 +1,6 @@
 # Chapter 4 — Progress
 
-- **Overall status:** In progress; CH4-01 through CH4-04 are complete, and CH4-05 remains pending.
+- **Overall status:** CH4-01 through CH4-05 implementation and verification complete.
 - **Current branch:** `feat/chapter-04-runner-security`
 - **Contract:** [`chapter-04.md`](./chapter-04.md)
 - **Design deltas:** [`design-deviations.md`](./design-deviations.md)
@@ -11,8 +11,8 @@
 - **Latest slice commit:** CH4-04 — `e711b27` (`fix: recover interrupted Chapter 4 slices`).
 - **Verified:** Fetched `origin/main` is already contained in the feature branch; documentation
   diff check passes.
-- **Current slice:** CH4-05 — completing the job and entering review.
-- **Remaining:** CH4-05.
+- **Current slice:** CH4-05 — completing the job and entering review; implementation is complete.
+- **Remaining:** Commit the verified CH4-05 changes and record its commit SHA.
 - **Blockers:** None.
 
 ## Slice status
@@ -23,7 +23,7 @@
 | CH4-02 — Initializing and locking the slice plan | Complete | 50 job CLI tests passed; 75 Gate/Runner regressions passed (1 skipped) | — | Depends on CH4-01 |
 | CH4-03 — Building and gating one TDD slice | Complete | 127 passed, 1 skipped; 2 focused tests passed | `d884be6` | Depends on CH4-02 |
 | CH4-04 — Recovering interrupted slices safely | Complete | 132 passed, 1 skipped; focused recovery tests passed | `e711b27` | Depends on CH4-01 through CH4-03 |
-| CH4-05 — Completing the job and entering review | Pending | — | — | Depends on CH4-03 and CH4-04 |
+| CH4-05 — Completing the job and entering review | Complete | 136 total, 1 skipped in full suite | Pending | Depends on CH4-03 and CH4-04 |
 
 ## CH4-01 — Registering human-approved M1 inputs
 
@@ -146,3 +146,25 @@
 - **CH4-04 result:** The journal remains authoritative across tested crash boundaries; uncertain
   sessions are never restarted, verified commits are re-gated, and uncommitted user changes are
   preserved.
+
+## CH4-05 — Completing the job and entering review
+
+- **Test seam:** The public `factory job run JOB_ID --profile PROFILE` command with a fake Runner,
+  temporary Git project, and the real full Gate/checks path.
+- **RED/GREEN:** The initial final-Gate failure test showed that `job run` returned without running
+  the required full Gate. The orchestrator now enters `GATE` only after every approved slice has a
+  durable PASS, records the final Gate attempt and report, and enters `REVIEW` only on PASS.
+- **Failure and recovery:** Final Gate FAIL/ERROR escalates to `NEEDS_HUMAN` with diagnostics.
+  An interrupted final Gate is not retried automatically; a persisted PASS recovers to `REVIEW`
+  without running the full Gate twice.
+- **Windows atomic-write reliability:** A transient `WinError 5` on `job.json` replacement
+  reproduced as a CLI failure. Atomic replacements now make a bounded retry for Windows sharing
+  and access errors; unrelated and persistent errors still propagate. The CLI regression test
+  failed before the retry and passed after it.
+- **Verification:** `py -3.14 -m unittest discover -s tests -v` — 136 tests, 1 skipped because
+  Windows symlink creation requires a privilege; `py -3.14 -m compileall -q factory tests` and
+  `git -c core.whitespace=cr-at-eol diff --check` passed.
+- **Unverified:** Full-Gate integration used a temporary project and fake Runner. No real Copilot
+  builder session, production `.factory/checks.py`, or deployment Python environment was exercised.
+- **CH4-05 result:** Final Gate is durable and state-neutral; only a verified PASS transitions the
+  job to `REVIEW`, with interruption recovery and Windows atomic-write behavior covered.
